@@ -435,9 +435,9 @@ def main():
     ds_train = dataset["train"]
     ds_val = dataset["dev"]
 
-    with open("/home/christoph.minixhofer/vocex/training/data/speaker2idx.json", "r") as f:
+    with open("data/speaker2idx.json", "r") as f:
         speaker2idx = json.load(f)
-    with open("/home/christoph.minixhofer/vocex/training/data/phone2idx.json", "r") as f:
+    with open("data/phone2idx.json", "r") as f:
         phone2idx = json.load(f)
 
     if args.is_conditional:
@@ -558,8 +558,7 @@ def main():
             clean_images = batch["vocex"].unsqueeze(1)
             #batch["mel"].unsqueeze(1) # [bsz, 1, 512, 80]
 
-            attn_mask = clean_images.sum(dim=-1) != 0 # [bsz, 1, 512]
-            attn_mask = attn_mask.squeeze(1) # [bsz, 512]
+            attn_mask = batch["phone_mask"]
 
             # pad to bsz, 1, 512, 128 from bsz, 1, 512, 80
             # clean_images = F.pad(clean_images, (0, 0, 0, 0, 0, 48), "constant", 0)
@@ -712,6 +711,7 @@ def main():
 
             images = accelerator.gather_for_metrics(images).cpu().numpy()
             phones = accelerator.gather_for_metrics(batch["phones"]).cpu().numpy()
+            phone_mask = accelerator.gather_for_metrics(batch["phone_mask"]).cpu().numpy()
 
             # denormalize the images and save to tensorboard
             # images_processed = (images * 255).round().astype("uint8")
@@ -737,10 +737,7 @@ def main():
                 else:
                     images = []
                     for i in range(images_processed.shape[0]):
-                        phones_i = phones[i]
-                        phones_mask = phones_i != phone2idx["<pad>"]
-                        img_masked = images_processed[i][phones_mask]
-                        img_masked = img_masked
+                        img_masked = images_processed[i][phone_mask[i]]
                         # normalize to 0, 1
                         img_masked = img_masked - img_masked.min()
                         img_masked = img_masked / img_masked.max()
