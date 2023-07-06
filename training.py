@@ -18,12 +18,10 @@ from accelerate.utils import ProjectConfiguration
 from datasets import load_dataset
 from huggingface_hub import HfFolder, whoami
 from tqdm.auto import tqdm
-import ptwt
-import pywt
 import numpy as np
 from vocex import Vocex
 
-from augmentations import wave_augmentation_func
+# from augmentations import wave_augmentation_func
 
 import diffusers
 from diffusers import DDPMScheduler, UNet2DModel, UNet2DConditionModel # DDPMPipeline
@@ -80,8 +78,14 @@ def parse_args():
     parser.add_argument(
         "--train_type",
         type=str,
-        default="mel",
+        default="vocex",
         help="Can be 'mel' or 'vocex'."
+    )
+    parser.add_argument(
+        "--cut_epochs_short",
+        type=int,
+        default=-1,
+        help="Cut epochs short for debugging."
     )
     parser.add_argument(
         "--model_config_name_or_path",
@@ -442,9 +446,9 @@ def main():
     if args.is_conditional:
         if args.train_type == "mel":
             phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=80*4)
+            vocex_projection = Projection(16, 80*4)
         elif args.train_type == "vocex":
             phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=16*4)
-            vocex_projection = Projection(16, 16*4)
         condition_projection = Projection(80, 128)
 
     vocex_model = Vocex.from_pretrained("cdminix/vocex").model.to("cpu")
@@ -487,7 +491,7 @@ def main():
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler, phone_embedding, condition_projection = accelerator.prepare(
             model, optimizer, train_dataloader, eval_dataloader, lr_scheduler, phone_embedding, condition_projection
         )
-        if args.train_type == "vocex":
+        if args.train_type == "mel":
             vocex_projection = accelerator.prepare(
                 vocex_projection
             )
@@ -553,6 +557,9 @@ def main():
         step = -1
         for batch in train_dataloader:
             step += 1
+
+            if args.cut_epochs_short != -1 and step >= args.cut_epochs_short:
+                break
 
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
@@ -688,6 +695,7 @@ def main():
                     unet=unet,
                     scheduler=noise_scheduler,
                     conditional=True,
+                    is_mel=args.train_type == "mel",
                 )
             else:
                 pipeline = DDPMPipeline(

@@ -18,10 +18,11 @@ class DDPMPipeline(DiffusionPipeline):
             [`DDPMScheduler`], or [`DDIMScheduler`].
     """
 
-    def __init__(self, unet, scheduler, conditional=False):
+    def __init__(self, unet, scheduler, conditional=False, is_mel=False):
         super().__init__()
         self.register_modules(unet=unet, scheduler=scheduler)
         self.conditional = conditional
+        self.is_mel = is_mel
 
     @torch.no_grad()
     def __call__(
@@ -71,12 +72,16 @@ class DDPMPipeline(DiffusionPipeline):
             image = randn_tensor(image_shape, device=self.device)
 
         if self.conditional:
-            phones = phones.reshape(image_shape[0], 4, -1, 16)
+            if self.is_mel:
+                height = 80
+            else:
+                height = 16
+            phones = phones.reshape(image_shape[0], 4, -1, height)
             # combine noise and phone
             if vocex is None:
                 image = torch.cat([image, phones], dim=1)
             else:
-                vocex = vocex.reshape(image_shape[0], 1, -1, 16)
+                vocex = vocex.reshape(image_shape[0], 4, -1, height)
                 image = torch.cat([image, phones, vocex], dim=1)
 
         # set step values
