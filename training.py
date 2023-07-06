@@ -49,7 +49,7 @@ class PhoneEmbedding(torch.nn.Module):
     def forward(self, phone):
         return self.embedding(phone)
     
-class ConditionProjection(torch.nn.Module):
+class Projection(torch.nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.linear = torch.nn.Linear(in_channels, out_channels)
@@ -78,6 +78,12 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
+        "--train_type",
+        type=str,
+        default="mel",
+        help="Can be 'mel' or 'vocex'."
+    )
+    parser.add_argument(
         "--model_config_name_or_path",
         type=str,
         default=None,
@@ -101,24 +107,6 @@ def parse_args():
         type=str,
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
-    )
-    parser.add_argument(
-        "--resolution_x",
-        type=int,
-        default=384,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
-    )
-    parser.add_argument(
-        "--resolution_y",
-        type=int,
-        default=16,
-        help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
-        ),
     )
     parser.add_argument(
         "--center_crop",
@@ -293,6 +281,13 @@ def main():
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
+    if args.train_type == "mel":
+        resolution_x = 512
+        resolution_y = 80
+    elif args.train_type == "vocex":
+        resolution_x = 384
+        resolution_y = 16
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -338,7 +333,7 @@ def main():
         # 512
         if not args.is_conditional:
             model = UNet2DModel(
-                sample_size=(args.resolution_x, args.resolution_y),
+                sample_size=(resolution_x, resolution_y),
                 in_channels=1,
                 out_channels=1,
                 layers_per_block=2,
@@ -368,9 +363,13 @@ def main():
                 # encoder_hid_dim=80,
             )
         else:
+            if args.train_type == "mel":
+                in_channels = 1 + 4 + 4 # noise, phone, vocex
+            elif args.train_type == "vocex":
+                in_channels = 1 + 4 # noise, phone
             model = UNet2DConditionModel(
-                sample_size=(args.resolution_x, args.resolution_y),
-                in_channels=5,
+                sample_size=(resolution_x, resolution_y),
+                in_channels=in_channels,
                 out_channels=1,
                 layers_per_block=2,
                 block_out_channels=(
@@ -441,8 +440,12 @@ def main():
         phone2idx = json.load(f)
 
     if args.is_conditional:
-        phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=16*4)
-        condition_projection = ConditionProjection(80, 128)
+        if args.train_type == "mel":
+            phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=80*4)
+        elif args.train_type == "vocex":
+            phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=16*4)
+            vocex_projection = Projection(16, 16*4)
+        condition_projection = Projection(80, 128)
 
     vocex_model = Vocex.from_pretrained("cdminix/vocex").model.to("cpu")
 
@@ -452,6 +455,7 @@ def main():
         use_speaker_prompt=True,
         overwrite_max_length=True,
         vocex_model=vocex_model,
+        expand_seq=args.train_type == "mel",
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -483,6 +487,10 @@ def main():
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler, phone_embedding, condition_projection = accelerator.prepare(
             model, optimizer, train_dataloader, eval_dataloader, lr_scheduler, phone_embedding, condition_projection
         )
+        if args.train_type == "vocex":
+            vocex_projection = accelerator.prepare(
+                vocex_projection
+            )
     else:
         # Prepare everything with our `accelerator`.
         model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -555,17 +563,23 @@ def main():
             
             # clean_images, _ = ptwt.cwt(batch["phone_durations"].to(torch.int32), torch.arange(1, 81, 0.1), "mexh")
             # clean_images = clean_images.transpose(0, 1) # [bsz, 32, 512]
-            clean_images = batch["vocex"].unsqueeze(1)
+            if args.train_type == "mel":
+                clean_images = batch["mel"].unsqueeze(1)
+            elif args.train_type == "vocex":
+                clean_images = batch["vocex"].unsqueeze(1)
             #batch["mel"].unsqueeze(1) # [bsz, 1, 512, 80]
 
-            attn_mask = batch["phone_mask"]
+            if args.train_type == "mel":
+                attn_mask = batch["frame_mask"]
+            elif args.train_type == "vocex":
+                attn_mask = batch["phone_mask"]
 
             # pad to bsz, 1, 512, 128 from bsz, 1, 512, 80
             # clean_images = F.pad(clean_images, (0, 0, 0, 0, 0, 48), "constant", 0)
 
             # mean & std norm
-
-            clean_images = (clean_images - args.mel_mean_norm) / args.mel_std_norm
+            if args.train_type == "mel":
+                clean_images = (clean_images - args.mel_mean_norm) / args.mel_std_norm
             # get to mean 0.5 and std 0.5
             clean_images = clean_images * 0.5 # * 0.5 + 0.5
 
@@ -576,13 +590,6 @@ def main():
             condition = condition * 0.5 # * 0.5 + 0.5
 
             enc_attn_mask = condition.sum(dim=-1) != 0 # [bsz, length]
-
-            # print(
-            #     f"clean_images.shape: {clean_images.shape},\n\
-            #     attn_mask.shape: {attn_mask.shape},\n\
-            #     condition.shape: {condition.shape},\n\
-            #     enc_attn_mask.shape: {enc_attn_mask.shape}".strip()
-            # )
 
             # Sample noise that we'll add to the images
             noise = torch.randn(clean_images.shape).to(clean_images.device)
@@ -598,14 +605,22 @@ def main():
 
 
             if args.is_conditional:
-                phone = batch["phones"]
-                phone = phone_embedding(phone) # [bsz, length, 80*4]
-                # make into [bsz, 4, length, 80]
-                phone = phone.reshape(bsz, 4, -1, 16)
-                # combine noise and phone
-                noisy_images = torch.cat([noisy_images, phone], dim=1)
+                if args.train_type == "mel":
+                    phone = batch["phones"]
+                    phone = phone_embedding(phone) # [bsz, length, 80*4]
+                    phone = phone.reshape(bsz, 4, -1, 80)
+                    vocex = batch["vocex"]
+                    vocex = vocex_projection(vocex)
+                    vocex = vocex.reshape(bsz, 4, -1, 80)
+                    # combine noise and phone
+                    noisy_images = torch.cat([noisy_images, phone, vocex], dim=1)
+                elif args.train_type == "vocex":
+                    phone = batch["phones"]
+                    phone = phone_embedding(phone)
+                    phone = phone.reshape(bsz, 4, -1, 16)
+                    noisy_images = torch.cat([noisy_images, phone], dim=1)
                 # project condition
-                condition = condition_projection(condition) # [bsz, length, 16]
+                condition = condition_projection(condition)
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
@@ -693,14 +708,26 @@ def main():
                         condition = condition_projection(condition)
                     enc_attn_mask = condition.sum(dim=-1) != 0
                     val_phone = phone_embedding(batch["phones"])
-                    images = pipeline(
-                        batch_size=args.eval_batch_size,
-                        num_inference_steps=args.ddpm_num_inference_steps,
-                        output_type="numpy",
-                        cond=condition,
-                        phones=val_phone,
-                        encoder_attention_mask=enc_attn_mask,
-                    ).images
+                    if args.train_type == "vocex":
+                        images = pipeline(
+                            batch_size=args.eval_batch_size,
+                            num_inference_steps=args.ddpm_num_inference_steps,
+                            output_type="numpy",
+                            cond=condition,
+                            phones=val_phone,
+                            encoder_attention_mask=enc_attn_mask,
+                        ).images
+                    elif args.train_type == "mel":
+                        val_vocex = vocex_projection(batch["vocex"])
+                        images = pipeline(
+                            batch_size=args.eval_batch_size,
+                            num_inference_steps=args.ddpm_num_inference_steps,
+                            output_type="numpy",
+                            cond=condition,
+                            phones=val_phone,
+                            vocex=val_vocex,
+                            encoder_attention_mask=enc_attn_mask,
+                        ).images
                     break
             else:
                 images = pipeline(

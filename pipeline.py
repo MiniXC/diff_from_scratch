@@ -32,6 +32,7 @@ class DDPMPipeline(DiffusionPipeline):
         return_dict: bool = True,
         cond: Optional[torch.Tensor] = None,
         phones: Optional[torch.Tensor] = None,
+        vocex: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
@@ -72,7 +73,11 @@ class DDPMPipeline(DiffusionPipeline):
         if self.conditional:
             phones = phones.reshape(image_shape[0], 4, -1, 16)
             # combine noise and phone
-            image = torch.cat([image, phones], dim=1)
+            if vocex is None:
+                image = torch.cat([image, phones], dim=1)
+            else:
+                vocex = vocex.reshape(image_shape[0], 1, -1, 16)
+                image = torch.cat([image, phones, vocex], dim=1)
 
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
