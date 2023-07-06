@@ -88,6 +88,12 @@ def parse_args():
         help="Cut epochs short for debugging."
     )
     parser.add_argument(
+        "--model_id",
+        type=str,
+        default="vocex-baseline",
+        help="The name of the model to train.",
+    )
+    parser.add_argument(
         "--model_config_name_or_path",
         type=str,
         default=None,
@@ -307,6 +313,7 @@ def main():
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
         import wandb
+        wandb.init(project="diffusers", config=vars(args), name=args.model_id)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
