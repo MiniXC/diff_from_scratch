@@ -313,7 +313,7 @@ def main():
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
         import wandb
-        wandb.init(project="diffusers", config=vars(args), name=args.model_id)
+        os.environ["WANDB_NAME"] = args.model_id
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
