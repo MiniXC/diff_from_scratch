@@ -170,22 +170,22 @@ def evaluate(
     # images_processed = (images * 255).round().astype("uint8")
 
 
-    if args.train_type == "mel":
-        import soundfile as sf
-        synth = Synthesiser()
-        audios = []
-        for i in range(images.shape[0]):
-            audios.append(
-                synth.synthesize(
-                    images[i][frame_mask]
-                )
-            )
-            # save audio
-            sf.write(
-                f"audio/audio_{epoch}_{i}.wav",
-                audios[-1],
-                22050,
-            )
+    # if args.train_type == "mel":
+    #     import soundfile as sf
+    #     synth = Synthesiser()
+    #     audios = []
+    #     for i in range(images.shape[0]):
+    #         audios.append(
+    #             synth.synthesize(
+    #                 images[i][frame_mask]
+    #             )
+    #         )
+    #         # save audio
+    #         sf.write(
+    #             f"audio/audio_{epoch}_{i}.wav",
+    #             audios[-1],
+    #             22050,
+    #         )
 
 
 
@@ -250,7 +250,7 @@ def parse_args():
     )
     parser.add_argument(
         "--eval_only",
-        default=True,
+        default=False,
         action="store_true",
         help="Whether to only run evaluation on the validation set only.",
     )
@@ -746,6 +746,7 @@ def main():
             condition_projection,
             vocex_projection,
         )
+        accelerator.wait_for_everyone()
 
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
