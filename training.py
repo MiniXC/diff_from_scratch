@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 import json
 
+from matplotlib import pyplot as plt
 import accelerate
 import datasets
 import torch
@@ -109,13 +110,12 @@ def evaluate(
             condition = batch["speaker_prompt_mel"]
             condition = (condition - args.mel_mean_norm) / args.mel_std_norm
             # get to mean 0.5 and std 0.5
-            condition = condition * 0.5 # * 0.5 + 0.5
+            condition = condition * 0.1 # * 0.5 + 0.5
             with torch.no_grad():
                 condition = condition_projection(condition)
             enc_attn_mask = condition.sum(dim=-1) != 0
             val_phone = phone_embedding(batch["phones"])
             if args.train_type == "vocex":
-                from matplotlib import pyplot as plt
                 images = pipeline(
                     batch_size=args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
@@ -125,8 +125,6 @@ def evaluate(
                     encoder_attention_mask=enc_attn_mask,
                 ).images
                 for ij in range(val_phone.shape[0]):
-                    print(batch["vocex"].mean(), batch["vocex"].std(), batch["vocex"].min(), batch["vocex"].max())
-                    print(images.mean(), images.std(), images.min(), images.max())
                     gt = batch["vocex"][ij][batch["phone_mask"][ij]].cpu().numpy().T
                     pred = images[ij][batch["phone_mask"][ij]].cpu().numpy().T
                     fig, axs = plt.subplots(2, 1)
@@ -145,6 +143,16 @@ def evaluate(
                     vocex=val_vocex,
                     encoder_attention_mask=enc_attn_mask,
                 ).images
+                for ij in range(val_phone.shape[0]):
+                    cond = batch["vocex"][ij][batch["frame_mask"][ij]].cpu().numpy().T
+                    gt = batch["mel"][ij][batch["frame_mask"][ij]].cpu().numpy().T
+                    pred = images[ij][batch["frame_mask"][ij]].cpu().numpy().T
+                    fig, axs = plt.subplots(3, 1)
+                    axs[0].imshow(cond)
+                    axs[1].imshow(gt)
+                    axs[2].imshow(pred)
+                    plt.savefig(f"audio/image_{ij}.png")
+                    plt.close()
             break
     else:
         images = pipeline(
@@ -219,7 +227,7 @@ def parse_args():
     parser.add_argument(
         "--train_type",
         type=str,
-        default="vocex",
+        default="mel",
         help="Can be 'mel' or 'vocex'."
     )
     parser.add_argument(
@@ -231,7 +239,7 @@ def parse_args():
     parser.add_argument(
         "--model_id",
         type=str,
-        default="vocex-baseline",
+        default="mel-v1",
         help="The name of the model to train.",
     )
     parser.add_argument(
@@ -249,7 +257,7 @@ def parse_args():
     parser.add_argument(
         "--load_from_checkpoint",
         type=str,
-        default="conditional_ddpm/checkpoint-20097",
+        default=None,
         help="The path to a checkpoint to load from.",
     )
     parser.add_argument(
@@ -473,7 +481,7 @@ def main():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
         os.environ["WANDB_NAME"] = args.model_id
         # set to offline mode to not sync wandb
-        os.environ["WANDB_MODE"] = "offline"
+        os.environ["WANDB_MODE"] = "online"
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -779,13 +787,13 @@ def main():
             if args.train_type == "mel":
                 clean_images = (clean_images - args.mel_mean_norm) / args.mel_std_norm
             # get to mean 0.5 and std 0.5
-            clean_images = clean_images * 0.5 # * 0.5 + 0.5
+            clean_images = clean_images * 0.1 # * 0.5 + 0.5
 
             condition = batch["speaker_prompt_mel"] # [bsz, length, 80]
 
             condition = (condition - args.mel_mean_norm) / args.mel_std_norm
             # get to mean 0.5 and std 0.5
-            condition = condition * 0.5 # * 0.5 + 0.5
+            condition = condition * 0.1 # * 0.5 + 0.5
 
             enc_attn_mask = condition.sum(dim=-1) != 0 # [bsz, length]
 
