@@ -20,6 +20,8 @@ from huggingface_hub import HfFolder, whoami
 from tqdm.auto import tqdm
 import numpy as np
 from vocex import Vocex
+from hifigan import Synthesiser
+import wandb
 
 # from augmentations import wave_augmentation_func
 
@@ -72,6 +74,145 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
 
+def evaluate(
+        model, 
+        args, 
+        accelerator, 
+        epoch, 
+        noise_scheduler, 
+        global_step, 
+        eval_dataloader, 
+        phone_embedding,
+        condition_projection, 
+        vocex_projection,
+    ):
+    unet = accelerator.unwrap_model(model)
+
+    if args.is_conditional:
+        pipeline = DDPMPipeline(
+            unet=unet,
+            scheduler=noise_scheduler,
+            conditional=True,
+            is_mel=args.train_type == "mel",
+        )
+    else:
+        pipeline = DDPMPipeline(
+            unet=unet,
+            scheduler=noise_scheduler,
+            conditional=False,
+        )
+
+    # run pipeline in inference (sample random noise and denoise)
+    if args.is_conditional:
+        # get conditions
+        for batch in eval_dataloader:
+            condition = batch["speaker_prompt_mel"]
+            condition = (condition - args.mel_mean_norm) / args.mel_std_norm
+            # get to mean 0.5 and std 0.5
+            condition = condition * 0.5 # * 0.5 + 0.5
+            with torch.no_grad():
+                condition = condition_projection(condition)
+            enc_attn_mask = condition.sum(dim=-1) != 0
+            val_phone = phone_embedding(batch["phones"])
+            if args.train_type == "vocex":
+                from matplotlib import pyplot as plt
+                images = pipeline(
+                    batch_size=args.eval_batch_size,
+                    num_inference_steps=args.ddpm_num_inference_steps,
+                    output_type="numpy",
+                    cond=condition,
+                    phones=val_phone,
+                    encoder_attention_mask=enc_attn_mask,
+                ).images
+                for ij in range(val_phone.shape[0]):
+                    print(batch["vocex"].mean(), batch["vocex"].std(), batch["vocex"].min(), batch["vocex"].max())
+                    print(images.mean(), images.std(), images.min(), images.max())
+                    gt = batch["vocex"][ij][batch["phone_mask"][ij]].cpu().numpy().T
+                    pred = images[ij][batch["phone_mask"][ij]].cpu().numpy().T
+                    fig, axs = plt.subplots(2, 1)
+                    axs[0].imshow(gt)
+                    axs[1].imshow(pred)
+                    plt.savefig(f"audio/image_{ij}.png")
+                    plt.close()
+            elif args.train_type == "mel":
+                val_vocex = vocex_projection(batch["vocex"])
+                images = pipeline(
+                    batch_size=args.eval_batch_size,
+                    num_inference_steps=args.ddpm_num_inference_steps,
+                    output_type="numpy",
+                    cond=condition,
+                    phones=val_phone,
+                    vocex=val_vocex,
+                    encoder_attention_mask=enc_attn_mask,
+                ).images
+            break
+    else:
+        images = pipeline(
+            batch_size=args.eval_batch_size,
+            num_inference_steps=args.ddpm_num_inference_steps,
+            output_type="numpy",
+        ).images
+
+    images = accelerator.gather_for_metrics(images).cpu().numpy()
+    phones = accelerator.gather_for_metrics(batch["phones"]).cpu().numpy()
+    phone_mask = accelerator.gather_for_metrics(batch["phone_mask"]).cpu().numpy()
+    frame_mask = accelerator.gather_for_metrics(batch["frame_mask"]).cpu().numpy()
+
+    # denormalize the images and save to tensorboard
+    # images_processed = (images * 255).round().astype("uint8")
+
+
+    if args.train_type == "mel":
+        import soundfile as sf
+        synth = Synthesiser()
+        audios = []
+        for i in range(images.shape[0]):
+            audios.append(
+                synth.synthesize(
+                    images[i][frame_mask]
+                )
+            )
+            # save audio
+            sf.write(
+                f"audio/audio_{epoch}_{i}.wav",
+                audios[-1],
+                22050,
+            )
+
+
+
+    images_processed = images - images.min()
+    images_processed = images_processed / images_processed.max()
+    images_processed = (images_processed * 255).round().astype("uint8")
+
+    accelerator.wait_for_everyone()
+
+    if args.logger == "tensorboard":
+        if is_accelerate_version(">=", "0.17.0.dev0"):
+            tracker = accelerator.get_tracker("tensorboard", unwrap=True)
+        else:
+            tracker = accelerator.get_tracker("tensorboard")
+        tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
+    elif args.logger == "wandb":
+        # Upcoming `log_images` helper coming in https://github.com/huggingface/accelerate/pull/962/files
+        if not args.is_conditional:
+            accelerator.get_tracker("wandb").log(
+                {"test_samples": [wandb.Image(img.T) for img in images_processed], "epoch": epoch},
+                step=global_step,
+            )
+        else:
+            images = []
+            for i in range(images_processed.shape[0]):
+                img_masked = images_processed[i][phone_mask[i]]
+                # normalize to 0, 1
+                img_masked = img_masked - img_masked.min()
+                img_masked = img_masked / img_masked.max()
+                images.append(wandb.Image(img_masked.T))
+            accelerator.get_tracker("wandb").log(
+                {"test_samples": images, "epoch": epoch},
+                step=global_step,
+            )
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -98,6 +239,24 @@ def parse_args():
         type=str,
         default=None,
         help="The config of the UNet model to train, leave as None to use standard DDPM configuration.",
+    )
+    parser.add_argument(
+        "--eval_only",
+        default=True,
+        action="store_true",
+        help="Whether to only run evaluation on the validation set only.",
+    )
+    parser.add_argument(
+        "--load_from_checkpoint",
+        type=str,
+        default="conditional_ddpm/checkpoint-20097",
+        help="The path to a checkpoint to load from.",
+    )
+    parser.add_argument(
+        "--save_local_examples",
+        default=False,
+        action="store_true",
+        help="Whether to save the generated images locally.",
     )
     parser.add_argument(
         "--is_conditional",
@@ -137,7 +296,7 @@ def parse_args():
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--eval_batch_size", type=int, default=1, help="The number of images to generate for evaluation."
+        "--eval_batch_size", type=int, default=2, help="The number of images to generate for evaluation."
     )
     parser.add_argument(
         "--dataloader_num_workers",
@@ -312,8 +471,9 @@ def main():
     elif args.logger == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
-        import wandb
         os.environ["WANDB_NAME"] = args.model_id
+        # set to offline mode to not sync wandb
+        os.environ["WANDB_MODE"] = "offline"
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -376,13 +536,17 @@ def main():
         else:
             if args.train_type == "mel":
                 in_channels = 1 + 4 + 4 # noise, phone, vocex
+                kernel_size = 3
             elif args.train_type == "vocex":
                 in_channels = 1 + 4 # noise, phone
+                kernel_size = 3
             model = UNet2DConditionModel(
                 sample_size=(resolution_x, resolution_y),
                 in_channels=in_channels,
                 out_channels=1,
                 layers_per_block=2,
+                conv_in_kernel=kernel_size,
+                conv_out_kernel=kernel_size,
                 block_out_channels=(
                     64,
                     64,
@@ -502,11 +666,16 @@ def main():
             vocex_projection = accelerator.prepare(
                 vocex_projection
             )
+        else:
+            vocex_projection = None
     else:
         # Prepare everything with our `accelerator`.
         model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dataloader, lr_scheduler
         )
+
+    if args.load_from_checkpoint is not None:
+        accelerator.load_state(args.load_from_checkpoint)
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
@@ -556,6 +725,20 @@ def main():
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
+    if args.eval_only:
+        evaluate(
+            model,
+            args,
+            accelerator,
+            0,
+            noise_scheduler,
+            0,
+            eval_dataloader,
+            phone_embedding,
+            condition_projection,
+            vocex_projection,
+        )
+
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
         model.train()
@@ -563,6 +746,7 @@ def main():
         progress_bar.set_description(f"Epoch {epoch}")
         step = -1
         for batch in train_dataloader:
+
             step += 1
 
             if args.cut_epochs_short != -1 and step >= args.cut_epochs_short:
@@ -695,120 +879,37 @@ def main():
 
         # Generate sample images for visual inspection
         if (epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1):
+            evaluate(
+                model,
+                args,
+                accelerator,
+                epoch,
+                noise_scheduler,
+                global_step,
+                eval_dataloader,
+                phone_embedding,
+                condition_projection,
+                vocex_projection,
+            )
+
+        accelerator.wait_for_everyone()
+
+        if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+            accelerator.wait_for_everyone()
+
+            # save the model
             unet = accelerator.unwrap_model(model)
 
-            if args.is_conditional:
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                    conditional=True,
-                    is_mel=args.train_type == "mel",
-                )
-            else:
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                    conditional=False,
-                )
+            pipeline = DDPMPipeline(
+                unet=unet,
+                scheduler=noise_scheduler,
+            )
 
-            # run pipeline in inference (sample random noise and denoise)
-            if args.is_conditional:
-                # get conditions
-                for batch in eval_dataloader:
-                    condition = batch["speaker_prompt_mel"]
-                    condition = (condition - args.mel_mean_norm) / args.mel_std_norm
-                    # get to mean 0.5 and std 0.5
-                    condition = condition * 0.5 # * 0.5 + 0.5
-                    with torch.no_grad():
-                        condition = condition_projection(condition)
-                    enc_attn_mask = condition.sum(dim=-1) != 0
-                    val_phone = phone_embedding(batch["phones"])
-                    if args.train_type == "vocex":
-                        images = pipeline(
-                            batch_size=args.eval_batch_size,
-                            num_inference_steps=args.ddpm_num_inference_steps,
-                            output_type="numpy",
-                            cond=condition,
-                            phones=val_phone,
-                            encoder_attention_mask=enc_attn_mask,
-                        ).images
-                    elif args.train_type == "mel":
-                        val_vocex = vocex_projection(batch["vocex"])
-                        images = pipeline(
-                            batch_size=args.eval_batch_size,
-                            num_inference_steps=args.ddpm_num_inference_steps,
-                            output_type="numpy",
-                            cond=condition,
-                            phones=val_phone,
-                            vocex=val_vocex,
-                            encoder_attention_mask=enc_attn_mask,
-                        ).images
-                    break
-            else:
-                images = pipeline(
-                    batch_size=args.eval_batch_size,
-                    num_inference_steps=args.ddpm_num_inference_steps,
-                    output_type="numpy",
-                ).images
+            accelerator.save_state(os.path.join(args.output_dir, f"checkpoint-{global_step}"))
 
-            images = accelerator.gather_for_metrics(images).cpu().numpy()
-            phones = accelerator.gather_for_metrics(batch["phones"]).cpu().numpy()
-            phone_mask = accelerator.gather_for_metrics(batch["phone_mask"]).cpu().numpy()
+            del unet
 
-            # denormalize the images and save to tensorboard
-            # images_processed = (images * 255).round().astype("uint8")
-            images_processed = images - images.min()
-            images_processed = images_processed / images_processed.max()
-            images_processed = (images_processed * 255).round().astype("uint8")
-
-            accelerator.wait_for_everyone()
-
-            if args.logger == "tensorboard":
-                if is_accelerate_version(">=", "0.17.0.dev0"):
-                    tracker = accelerator.get_tracker("tensorboard", unwrap=True)
-                else:
-                    tracker = accelerator.get_tracker("tensorboard")
-                tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
-            elif args.logger == "wandb":
-                # Upcoming `log_images` helper coming in https://github.com/huggingface/accelerate/pull/962/files
-                if not args.is_conditional:
-                    accelerator.get_tracker("wandb").log(
-                        {"test_samples": [wandb.Image(img.T) for img in images_processed], "epoch": epoch},
-                        step=global_step,
-                    )
-                else:
-                    images = []
-                    for i in range(images_processed.shape[0]):
-                        img_masked = images_processed[i][phone_mask[i]]
-                        # normalize to 0, 1
-                        img_masked = img_masked - img_masked.min()
-                        img_masked = img_masked / img_masked.max()
-                        images.append(wandb.Image(img_masked.T))
-                    accelerator.get_tracker("wandb").log(
-                        {"test_samples": images, "epoch": epoch},
-                        step=global_step,
-                    )
-
-            accelerator.wait_for_everyone()
-
-            del unet, pipeline, images, images_processed
-
-            if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
-                accelerator.wait_for_everyone()
-
-                # save the model
-                unet = accelerator.unwrap_model(model)
-
-                pipeline = DDPMPipeline(
-                    unet=unet,
-                    scheduler=noise_scheduler,
-                )
-
-                accelerator.save_state(os.path.join(args.output_dir, f"checkpoint-{global_step}"))
-
-                del unet
-
-            accelerator.wait_for_everyone()
+        accelerator.wait_for_everyone()
 
     accelerator.end_training()
 
