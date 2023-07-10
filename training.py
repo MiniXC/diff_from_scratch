@@ -7,6 +7,8 @@ import shutil
 from pathlib import Path
 from typing import Optional
 import json
+# PIL
+from PIL import Image
 
 from matplotlib import pyplot as plt
 import accelerate
@@ -110,7 +112,7 @@ def evaluate(
             condition = batch["speaker_prompt_mel"]
             condition = (condition - args.mel_mean_norm) / args.mel_std_norm
             # get to mean 0.5 and std 0.5
-            condition = condition * 0.1 # * 0.5 + 0.5
+            condition = condition * 0.5 # * 0.5 + 0.5
             with torch.no_grad():
                 condition = condition_projection(condition)
             enc_attn_mask = condition.sum(dim=-1) != 0
@@ -128,10 +130,17 @@ def evaluate(
                     gt = batch["vocex"][ij][batch["phone_mask"][ij]].cpu().numpy().T
                     pred = images[ij][batch["phone_mask"][ij]].cpu().numpy().T
                     fig, axs = plt.subplots(2, 1)
-                    axs[0].imshow(gt)
-                    axs[1].imshow(pred)
+                    axs[0].imshow(gt, vmin=gt.min(), vmax=gt.max())
+                    axs[0].set_title(f"gt min: {gt.min()}, gt max: {gt.max()}")
+                    axs[1].imshow(pred, vmin=gt.min(), vmax=gt.max())
+                    axs[1].set_title(f"pred min: {pred.min()}, pred max: {pred.max()}")
+                    # log to wandb
                     plt.savefig(f"audio/image_{ij}.png")
                     plt.close()
+                    # load image using PIL
+                    img = Image.open(f"audio/image_{ij}.png")
+                    # log to wandb
+                    wandb.log({"image": [wandb.Image(img)]})
             elif args.train_type == "mel":
                 val_vocex = vocex_projection(batch["vocex"])
                 images = pipeline(
@@ -153,6 +162,10 @@ def evaluate(
                     axs[2].imshow(pred)
                     plt.savefig(f"audio/image_{ij}.png")
                     plt.close()
+                    # load image using PIL
+                    img = Image.open(f"audio/image_{ij}.png")
+                    # log to wandb
+                    wandb.log({"image": [wandb.Image(img)]})
             break
     else:
         images = pipeline(
@@ -227,7 +240,7 @@ def parse_args():
     parser.add_argument(
         "--train_type",
         type=str,
-        default="mel",
+        default="vocex",
         help="Can be 'mel' or 'vocex'."
     )
     parser.add_argument(
@@ -250,14 +263,20 @@ def parse_args():
     )
     parser.add_argument(
         "--eval_only",
-        default=False,
+        default=True,
         action="store_true",
         help="Whether to only run evaluation on the validation set only.",
     )
     parser.add_argument(
+        "--scale_factor",
+        type=float,
+        default=0.1,
+        help="The scale factor to apply to the noise sampled from the diffusion process.",
+    )
+    parser.add_argument(
         "--load_from_checkpoint",
         type=str,
-        default=None,
+        default="conditional_ddpm/checkpoint-71775",
         help="The path to a checkpoint to load from.",
     )
     parser.add_argument(
@@ -413,6 +432,12 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--wandb_mode", 
+        type=str,
+        default="online",
+        help="Whether to use wandb in offline mode or not."
+    )
+    parser.add_argument(
         "--log_loss_every",
         type=int,
         default=100,
@@ -481,7 +506,7 @@ def main():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
         os.environ["WANDB_NAME"] = args.model_id
         # set to offline mode to not sync wandb
-        os.environ["WANDB_MODE"] = "online"
+        os.environ["WANDB_MODE"] = args.wandb_mode
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -788,13 +813,13 @@ def main():
             if args.train_type == "mel":
                 clean_images = (clean_images - args.mel_mean_norm) / args.mel_std_norm
             # get to mean 0.5 and std 0.5
-            clean_images = clean_images * 0.1 # * 0.5 + 0.5
+            clean_images = clean_images * args.scale_factor # * 0.5 + 0.5
 
             condition = batch["speaker_prompt_mel"] # [bsz, length, 80]
 
             condition = (condition - args.mel_mean_norm) / args.mel_std_norm
             # get to mean 0.5 and std 0.5
-            condition = condition * 0.1 # * 0.5 + 0.5
+            condition = condition * 0.5 # * 0.5 + 0.5
 
             enc_attn_mask = condition.sum(dim=-1) != 0 # [bsz, length]
 
