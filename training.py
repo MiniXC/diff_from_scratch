@@ -43,6 +43,24 @@ check_min_version("0.18.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
 
+def normalize_vocex(x):
+    x = torch.clamp(x, min=-3, max=5)
+    x = ((x + 3) / 8) * 2 - 1
+
+def denormalize_vocex(x):
+    x = (x + 1) / 2
+    x = x * 8 - 3
+    return x
+
+def normalize_mel(x):
+    x = torch.clamp(x, min=-10, max=0)
+    x = (x + 5) / 5
+    return x
+
+def denormalize_mel(x):
+    x = x * 5 - 5
+    return x
+
 class PhoneEmbedding(torch.nn.Module):
     def __init__(self, phone2idx, embedding_dim=80):
         super().__init__()
@@ -105,14 +123,14 @@ def evaluate(
             conditional=False,
         )
 
+    mse_losses = []
+
     # run pipeline in inference (sample random noise and denoise)
     if args.is_conditional:
         # get conditions
         for batch in eval_dataloader:
             condition = batch["speaker_prompt_mel"]
-            condition = (condition - args.mel_mean_norm) / args.mel_std_norm
-            # get to mean 0.5 and std 0.5
-            condition = condition * 0.5 # * 0.5 + 0.5
+            condition = normalize_mel(condition)
             with torch.no_grad():
                 condition = condition_projection(condition)
             enc_attn_mask = condition.sum(dim=-1) != 0
@@ -129,6 +147,8 @@ def evaluate(
                 for ij in range(val_phone.shape[0]):
                     gt = batch["vocex"][ij][batch["phone_mask"][ij]].cpu().numpy().T
                     pred = images[ij][batch["phone_mask"][ij]].cpu().numpy().T
+                    pred = denormalize_vocex(pred)
+                    mse_losses.append(((gt - pred) ** 2).mean())
                     fig, axs = plt.subplots(2, 1)
                     axs[0].imshow(gt, vmin=gt.min(), vmax=gt.max())
                     axs[0].set_title(f"gt min: {gt.min()}, gt max: {gt.max()}")
@@ -140,9 +160,9 @@ def evaluate(
                     # load image using PIL
                     img = Image.open(f"audio/image_{ij}.png")
                     # log to wandb
-                    wandb.log({"image": [wandb.Image(img)]})
+                    accelerator.get_tracker("wandb").log({"val/plot": [wandb.Image(img)]}, step=global_step)
             elif args.train_type == "mel":
-                val_vocex = vocex_projection(batch["vocex"])
+                val_vocex = vocex_projection(normalize_vocex(batch["vocex"]))
                 images = pipeline(
                     batch_size=args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
@@ -156,6 +176,8 @@ def evaluate(
                     cond = batch["vocex"][ij][batch["frame_mask"][ij]].cpu().numpy().T
                     gt = batch["mel"][ij][batch["frame_mask"][ij]].cpu().numpy().T
                     pred = images[ij][batch["frame_mask"][ij]].cpu().numpy().T
+                    pred = denormalize_mel(pred)
+                    mse_losses.append(((gt - pred) ** 2).mean())
                     fig, axs = plt.subplots(3, 1)
                     axs[0].imshow(cond)
                     axs[1].imshow(gt)
@@ -165,7 +187,7 @@ def evaluate(
                     # load image using PIL
                     img = Image.open(f"audio/image_{ij}.png")
                     # log to wandb
-                    wandb.log({"image": [wandb.Image(img)]})
+                    accelerator.get_tracker("wandb").log({"val/plot": [wandb.Image(img)]}, step=global_step)
             break
     else:
         images = pipeline(
@@ -173,6 +195,11 @@ def evaluate(
             num_inference_steps=args.ddpm_num_inference_steps,
             output_type="numpy",
         ).images
+
+
+    if len(mse_losses) > 0:
+        print(f"mse loss: {np.mean(mse_losses)}")
+        accelerator.get_tracker("wandb").log({"val/mse_loss": np.mean(mse_losses)}, step=global_step)
 
     images = accelerator.gather_for_metrics(images).cpu().numpy()
     phones = accelerator.gather_for_metrics(batch["phones"]).cpu().numpy()
@@ -205,6 +232,12 @@ def evaluate(
     images_processed = images - images.min()
     images_processed = images_processed / images_processed.max()
     images_processed = (images_processed * 255).round().astype("uint8")
+
+    gt_images_processed = gt_images - gt_images.min()
+    gt_images_processed = gt_images_processed / gt_images_processed.max()
+    gt_images_processed = (gt_images_processed * 255).round().astype("uint8")
+
+    maes = []
 
     accelerator.wait_for_everyone()
 
@@ -270,13 +303,13 @@ def parse_args():
     parser.add_argument(
         "--scale_factor",
         type=float,
-        default=0.1,
+        default=0.7,
         help="The scale factor to apply to the noise sampled from the diffusion process.",
     )
     parser.add_argument(
         "--load_from_checkpoint",
         type=str,
-        default="conditional_ddpm/checkpoint-71775",
+        default=None,
         help="The path to a checkpoint to load from.",
     )
     parser.add_argument(
@@ -572,7 +605,7 @@ def main():
                 kernel_size = 3
             elif args.train_type == "vocex":
                 in_channels = 1 + 4 # noise, phone
-                kernel_size = 3
+                kernel_size = 1
             model = UNet2DConditionModel(
                 sample_size=(resolution_x, resolution_y),
                 in_channels=in_channels,
@@ -811,15 +844,16 @@ def main():
 
             # mean & std norm
             if args.train_type == "mel":
-                clean_images = (clean_images - args.mel_mean_norm) / args.mel_std_norm
+                clean_images = normalize_mel(clean_images)
+            elif args.train_type == "vocex":
+                clean_images = normalize_vocex(clean_images)
             # get to mean 0.5 and std 0.5
             clean_images = clean_images * args.scale_factor # * 0.5 + 0.5
 
             condition = batch["speaker_prompt_mel"] # [bsz, length, 80]
 
-            condition = (condition - args.mel_mean_norm) / args.mel_std_norm
-            # get to mean 0.5 and std 0.5
-            condition = condition * 0.5 # * 0.5 + 0.5
+            condition = normalize_mel(condition)
+            condition = condition
 
             enc_attn_mask = condition.sum(dim=-1) != 0 # [bsz, length]
 
@@ -841,7 +875,7 @@ def main():
                     phone = batch["phones"]
                     phone = phone_embedding(phone) # [bsz, length, 80*4]
                     phone = phone.reshape(bsz, 4, -1, 80)
-                    vocex = batch["vocex"]
+                    vocex = normalize_vocex(batch["vocex"])
                     vocex = vocex_projection(vocex)
                     vocex = vocex.reshape(bsz, 4, -1, 80)
                     # combine noise and phone
