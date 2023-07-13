@@ -9,6 +9,7 @@ from typing import Optional
 import json
 # PIL
 from PIL import Image
+import soundfile as sf
 
 from matplotlib import pyplot as plt
 import accelerate
@@ -46,6 +47,7 @@ logger = get_logger(__name__, log_level="INFO")
 def normalize_vocex(x):
     x = torch.clamp(x, min=-3, max=5)
     x = ((x + 3) / 8) * 2 - 1
+    return x
 
 def denormalize_vocex(x):
     x = (x + 1) / 2
@@ -53,12 +55,13 @@ def denormalize_vocex(x):
     return x
 
 def normalize_mel(x):
-    x = torch.clamp(x, min=-10, max=0)
-    x = (x + 5) / 5
+    x = torch.clamp(x, min=-11, max=2)
+    x = ((x + 11) / 13) * 2 - 1
     return x
 
 def denormalize_mel(x):
-    x = x * 5 - 5
+    x = (x + 1) / 2
+    x = x * 13 - 11
     return x
 
 class PhoneEmbedding(torch.nn.Module):
@@ -106,8 +109,10 @@ def evaluate(
         phone_embedding,
         condition_projection, 
         vocex_projection,
+        phone2idx=None,
     ):
-    unet = accelerator.unwrap_model(model)
+    unet = model
+    synth = Synthesiser()
 
     if args.is_conditional:
         pipeline = DDPMPipeline(
@@ -145,22 +150,33 @@ def evaluate(
                     encoder_attention_mask=enc_attn_mask,
                 ).images
                 for ij in range(val_phone.shape[0]):
-                    gt = batch["vocex"][ij][batch["phone_mask"][ij]].cpu().numpy().T
-                    pred = images[ij][batch["phone_mask"][ij]].cpu().numpy().T
+                    gt = batch["vocex"][ij][batch["phone_mask"][ij]]
+                    pred = images[ij][batch["phone_mask"][ij]]
                     pred = denormalize_vocex(pred)
                     mse_losses.append(((gt - pred) ** 2).mean())
+                    gt = gt.cpu().numpy().T
+                    pred = pred.cpu().numpy().T
                     fig, axs = plt.subplots(2, 1)
                     axs[0].imshow(gt, vmin=gt.min(), vmax=gt.max())
                     axs[0].set_title(f"gt min: {gt.min()}, gt max: {gt.max()}")
                     axs[1].imshow(pred, vmin=gt.min(), vmax=gt.max())
                     axs[1].set_title(f"pred min: {pred.min()}, pred max: {pred.max()}")
+                    if phone2idx is not None:
+                        idx2phone = {str(v): k for k, v in phone2idx.items()}
+                        phone_ticks = [idx2phone[str(p)] for p in batch["phones"][ij][batch["phone_mask"][ij]].cpu().numpy()]
+                        axs[1].set_xticks(range(len(phone_ticks)))
+                        axs[1].set_xticklabels(phone_ticks)
+                        # set orientation
+                        for tick in axs[1].get_xticklabels():
+                            tick.set_rotation(90)
                     # log to wandb
-                    plt.savefig(f"audio/image_{ij}.png")
+                    process_idx = accelerator.process_index
+                    plt.savefig(f"audio/image_{ij}_{process_idx}.png")
                     plt.close()
-                    # load image using PIL
-                    img = Image.open(f"audio/image_{ij}.png")
                     # log to wandb
-                    accelerator.get_tracker("wandb").log({"val/plot": [wandb.Image(img)]}, step=global_step)
+                    if accelerator.is_main_process:
+                        img = Image.open(f"audio/image_{ij}_{process_idx}.png")
+                        accelerator.get_tracker("wandb").log({f"val/plot_{ij}_{process_idx}": [wandb.Image(img)]}, step=global_step)
             elif args.train_type == "mel":
                 val_vocex = vocex_projection(normalize_vocex(batch["vocex"]))
                 images = pipeline(
@@ -173,21 +189,27 @@ def evaluate(
                     encoder_attention_mask=enc_attn_mask,
                 ).images
                 for ij in range(val_phone.shape[0]):
-                    cond = batch["vocex"][ij][batch["frame_mask"][ij]].cpu().numpy().T
-                    gt = batch["mel"][ij][batch["frame_mask"][ij]].cpu().numpy().T
-                    pred = images[ij][batch["frame_mask"][ij]].cpu().numpy().T
+                    cond = batch["vocex"][ij][batch["frame_mask"][ij]]
+                    gt = batch["mel"][ij][batch["frame_mask"][ij]]
+                    pred = images[ij][batch["frame_mask"][ij]]
                     pred = denormalize_mel(pred)
                     mse_losses.append(((gt - pred) ** 2).mean())
+                    cond = cond.cpu().numpy().T
+                    gt = gt.cpu().numpy().T
+                    pred = pred.cpu().numpy().T
                     fig, axs = plt.subplots(3, 1)
-                    axs[0].imshow(cond)
-                    axs[1].imshow(gt)
-                    axs[2].imshow(pred)
-                    plt.savefig(f"audio/image_{ij}.png")
+                    axs[0].imshow(cond, origin="lower")
+                    axs[0].set_title(f"cond min: {cond.min()}, cond max: {cond.max()}")
+                    axs[1].imshow(gt, vmin=gt.min(), vmax=gt.max(), origin="lower")
+                    axs[1].set_title(f"gt min: {gt.min()}, gt max: {gt.max()}")
+                    axs[2].imshow(pred, vmin=gt.min(), vmax=gt.max(), origin="lower")
+                    axs[2].set_title(f"pred min: {pred.min()}, pred max: {pred.max()}")
+                    process_idx = accelerator.process_index
+                    plt.savefig(f"audio/image_{ij}_{process_idx}.png")
                     plt.close()
-                    # load image using PIL
-                    img = Image.open(f"audio/image_{ij}.png")
-                    # log to wandb
-                    accelerator.get_tracker("wandb").log({"val/plot": [wandb.Image(img)]}, step=global_step)
+                    if accelerator.is_main_process:
+                        img = Image.open(f"audio/image_{ij}_{process_idx}.png")
+                        accelerator.get_tracker("wandb").log({"val/plot": [wandb.Image(img)]}, step=global_step)
             break
     else:
         images = pipeline(
@@ -197,75 +219,33 @@ def evaluate(
         ).images
 
 
+    mse_losses = accelerator.gather(mse_losses)
+
     if len(mse_losses) > 0:
-        print(f"mse loss: {np.mean(mse_losses)}")
-        accelerator.get_tracker("wandb").log({"val/mse_loss": np.mean(mse_losses)}, step=global_step)
-
-    images = accelerator.gather_for_metrics(images).cpu().numpy()
-    phones = accelerator.gather_for_metrics(batch["phones"]).cpu().numpy()
-    phone_mask = accelerator.gather_for_metrics(batch["phone_mask"]).cpu().numpy()
-    frame_mask = accelerator.gather_for_metrics(batch["frame_mask"]).cpu().numpy()
-
-    # denormalize the images and save to tensorboard
-    # images_processed = (images * 255).round().astype("uint8")
+        mse_losses = torch.cat(mse_losses)
+        accelerator.print(f"mse loss: {torch.mean(mse_losses)}")
+        accelerator.get_tracker("wandb").log({"val/mse_loss": torch.mean(mse_losses)}, step=global_step)
 
 
-    # if args.train_type == "mel":
-    #     import soundfile as sf
-    #     synth = Synthesiser()
-    #     audios = []
-    #     for i in range(images.shape[0]):
-    #         audios.append(
-    #             synth.synthesize(
-    #                 images[i][frame_mask]
-    #             )
-    #         )
-    #         # save audio
-    #         sf.write(
-    #             f"audio/audio_{epoch}_{i}.wav",
-    #             audios[-1],
-    #             22050,
-    #         )
-
-
-
-    images_processed = images - images.min()
-    images_processed = images_processed / images_processed.max()
-    images_processed = (images_processed * 255).round().astype("uint8")
-
-    gt_images_processed = gt_images - gt_images.min()
-    gt_images_processed = gt_images_processed / gt_images_processed.max()
-    gt_images_processed = (gt_images_processed * 255).round().astype("uint8")
-
-    maes = []
-
-    accelerator.wait_for_everyone()
-
-    if args.logger == "tensorboard":
-        if is_accelerate_version(">=", "0.17.0.dev0"):
-            tracker = accelerator.get_tracker("tensorboard", unwrap=True)
-        else:
-            tracker = accelerator.get_tracker("tensorboard")
-        tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
-    elif args.logger == "wandb":
-        # Upcoming `log_images` helper coming in https://github.com/huggingface/accelerate/pull/962/files
-        if not args.is_conditional:
-            accelerator.get_tracker("wandb").log(
-                {"test_samples": [wandb.Image(img.T) for img in images_processed], "epoch": epoch},
-                step=global_step,
+    if args.train_type == "mel":
+        audios = []
+        process_idx = accelerator.process_index
+        for i in range(images.shape[0]):
+            audios.append(
+                synth(
+                    images[i][batch["frame_mask"][i]].cpu()
+                )
             )
-        else:
-            images = []
-            for i in range(images_processed.shape[0]):
-                img_masked = images_processed[i][phone_mask[i]]
-                # normalize to 0, 1
-                img_masked = img_masked - img_masked.min()
-                img_masked = img_masked / img_masked.max()
-                images.append(wandb.Image(img_masked.T))
-            accelerator.get_tracker("wandb").log(
-                {"test_samples": images, "epoch": epoch},
-                step=global_step,
+            # save audio
+            sf.write(
+                f"audio/audio_{i}_{process_idx}.wav",
+                audios[-1],
+                22050,
             )
+            # log to wandb
+            accelerator.get_tracker("wandb").log({
+                f"val/audio_{i}_{process_idx}": wandb.Audio(f"audio/audio_{i}_{process_idx}.wav")
+            }, step=global_step)
 
 
 def parse_args():
@@ -273,7 +253,7 @@ def parse_args():
     parser.add_argument(
         "--train_type",
         type=str,
-        default="vocex",
+        default="mel",
         help="Can be 'mel' or 'vocex'."
     )
     parser.add_argument(
@@ -356,7 +336,7 @@ def parse_args():
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--eval_batch_size", type=int, default=2, help="The number of images to generate for evaluation."
+        "--eval_batch_size", type=int, default=1, help="The number of images to generate for evaluation."
     )
     parser.add_argument(
         "--dataloader_num_workers",
@@ -803,6 +783,7 @@ def main():
             phone_embedding,
             condition_projection,
             vocex_projection,
+            phone2idx,
         )
         accelerator.wait_for_everyone()
 
@@ -839,15 +820,13 @@ def main():
             elif args.train_type == "vocex":
                 attn_mask = batch["phone_mask"]
 
-            # pad to bsz, 1, 512, 128 from bsz, 1, 512, 80
-            # clean_images = F.pad(clean_images, (0, 0, 0, 0, 0, 48), "constant", 0)
-
             # mean & std norm
             if args.train_type == "mel":
                 clean_images = normalize_mel(clean_images)
             elif args.train_type == "vocex":
                 clean_images = normalize_vocex(clean_images)
             # get to mean 0.5 and std 0.5
+
             clean_images = clean_images * args.scale_factor # * 0.5 + 0.5
 
             condition = batch["speaker_prompt_mel"] # [bsz, length, 80]
