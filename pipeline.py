@@ -29,7 +29,6 @@ class DDPMPipeline(DiffusionPipeline):
         self,
         batch_size: int = 1,
         num_inference_steps: int = 1000,
-        output_type: Optional[str] = "pil",
         return_dict: bool = True,
         cond: Optional[torch.Tensor] = None,
         phones: Optional[torch.Tensor] = None,
@@ -103,10 +102,5 @@ class DDPMPipeline(DiffusionPipeline):
             image = self.scheduler.step(model_output, t, image).prev_sample
 
         image = image[:, 0]
-        if output_type == "pil":
-            image = self.numpy_to_pil(image)
-
-        if not return_dict:
-            return (image,)
-
-        return ImagePipelineOutput(images=image)
+        
+        return image

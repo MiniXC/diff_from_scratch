@@ -111,7 +111,7 @@ def evaluate(
         vocex_projection,
         phone2idx=None,
     ):
-    unet = model
+    unet = accelerator.unwrap_model(model)
     synth = Synthesiser()
 
     if args.is_conditional:
@@ -144,11 +144,10 @@ def evaluate(
                 images = pipeline(
                     batch_size=args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
-                    output_type="numpy",
                     cond=condition,
                     phones=val_phone,
                     encoder_attention_mask=enc_attn_mask,
-                ).images
+                )
                 for ij in range(val_phone.shape[0]):
                     gt = batch["vocex"][ij][batch["phone_mask"][ij]]
                     pred = images[ij][batch["phone_mask"][ij]]
@@ -182,12 +181,11 @@ def evaluate(
                 images = pipeline(
                     batch_size=args.eval_batch_size,
                     num_inference_steps=args.ddpm_num_inference_steps,
-                    output_type="numpy",
                     cond=condition,
                     phones=val_phone,
                     vocex=val_vocex,
                     encoder_attention_mask=enc_attn_mask,
-                ).images
+                )
                 for ij in range(val_phone.shape[0]):
                     cond = batch["vocex"][ij][batch["frame_mask"][ij]]
                     gt = batch["mel"][ij][batch["frame_mask"][ij]]
@@ -215,8 +213,7 @@ def evaluate(
         images = pipeline(
             batch_size=args.eval_batch_size,
             num_inference_steps=args.ddpm_num_inference_steps,
-            output_type="numpy",
-        ).images
+        )
 
 
     mse_losses = accelerator.gather(mse_losses)
@@ -304,13 +301,6 @@ def parse_args():
         action="store_true",
         help="Whether the model should be trained in conditional mode.",
     )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="conditional_ddpm",
-        help="The output directory where the model predictions and checkpoints will be written.",
-    )
-    parser.add_argument("--overwrite_output_dir", action="store_true")
     parser.add_argument(
         "--cache_dir",
         type=str,
@@ -493,8 +483,8 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 def main():
     args = parse_args()
 
-    logging_dir = os.path.join(args.output_dir, args.logging_dir)
-    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    logging_dir = os.path.join(args.model_id, args.logging_dir)
+    accelerator_project_config = ProjectConfiguration(project_dir=args.model_id, logging_dir=logging_dir)
 
     if args.train_type == "mel":
         resolution_x = 512
@@ -537,8 +527,8 @@ def main():
 
     # Handle the repository creation
     if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+        if args.model_id is not None:
+            os.makedirs(args.model_id, exist_ok=True)
 
     # Initialize the model
     if args.model_config_name_or_path is None:
@@ -752,7 +742,7 @@ def main():
             path = os.path.basename(args.resume_from_checkpoint)
         else:
             # Get the most recent checkpoint
-            dirs = os.listdir(args.output_dir)
+            dirs = os.listdir(args.model_id)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
@@ -764,7 +754,7 @@ def main():
             args.resume_from_checkpoint = None
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            accelerator.load_state(os.path.join(args.model_id, path))
             global_step = int(path.split("-")[1])
 
             resume_global_step = global_step * args.gradient_accumulation_steps
@@ -952,7 +942,7 @@ def main():
                 scheduler=noise_scheduler,
             )
 
-            accelerator.save_state(os.path.join(args.output_dir, f"checkpoint-{global_step}"))
+            accelerator.save_state(os.path.join(args.model_id, f"checkpoint-{global_step}"))
 
             del unet
 
