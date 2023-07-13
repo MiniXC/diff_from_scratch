@@ -236,7 +236,7 @@ def evaluate(
             # save audio
             sf.write(
                 f"audio/audio_{i}_{process_idx}.wav",
-                audios[-1],
+                audios[-1][0],
                 22050,
             )
             # log to wandb
