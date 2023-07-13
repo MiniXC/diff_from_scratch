@@ -111,7 +111,7 @@ def evaluate(
         vocex_projection,
         phone2idx=None,
     ):
-    unet = model
+    unet = accelerator.unwrap_model(model)
     synth = Synthesiser()
 
     if args.is_conditional:
@@ -239,7 +239,7 @@ def evaluate(
             # save audio
             sf.write(
                 f"audio/audio_{i}_{process_idx}.wav",
-                audios[-1],
+                audios[-1][0],
                 22050,
             )
             # log to wandb
