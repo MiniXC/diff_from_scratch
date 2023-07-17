@@ -1,6 +1,7 @@
 from typing import List, Optional, Tuple, Union
 
 import torch
+import numpy as np
 
 from diffusers.utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
@@ -18,11 +19,12 @@ class DDPMPipeline(DiffusionPipeline):
             [`DDPMScheduler`], or [`DDIMScheduler`].
     """
 
-    def __init__(self, unet, scheduler, conditional=False, is_mel=False):
+    def __init__(self, unet, scheduler, conditional=False, is_mel=False, seed=None):
         super().__init__()
         self.register_modules(unet=unet, scheduler=scheduler)
         self.conditional = conditional
         self.is_mel = is_mel
+        self.seed = seed
 
     @torch.no_grad()
     def __call__(
@@ -52,6 +54,12 @@ class DDPMPipeline(DiffusionPipeline):
             [`~pipelines.ImagePipelineOutput`] or `tuple`: [`~pipelines.utils.ImagePipelineOutput`] if `return_dict` is
             True, otherwise a `tuple. When returning a tuple, the first element is a list with the generated images.
         """
+
+        if self.seed is not None:
+            # set seed and make deterministic
+            torch.manual_seed(self.seed)
+            np.random.seed(self.seed)
+
         # Sample gaussian noise to begin loop
         if isinstance(self.unet.config.sample_size, int):
             image_shape = (

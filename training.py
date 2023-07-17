@@ -226,6 +226,7 @@ def evaluate(
 
     if args.train_type == "mel":
         audios = []
+        gt_audios = []
         process_idx = accelerator.process_index
         for i in range(images.shape[0]):
             audios.append(
@@ -242,6 +243,22 @@ def evaluate(
             # log to wandb
             accelerator.get_tracker("wandb").log({
                 f"val/audio_{i}_{process_idx}": wandb.Audio(f"audio/audio_{i}_{process_idx}.wav")
+            }, step=global_step)
+            # do the same for the gt
+            gt_audios.append(
+                synth(
+                    batch["mel"][i][batch["frame_mask"][i]].cpu()
+                )
+            )
+            # save audio
+            sf.write(
+                f"audio/gt_audio_{i}_{process_idx}.wav",
+                gt_audios[-1][0],
+                22050,
+            )
+            # log to wandb
+            accelerator.get_tracker("wandb").log({
+                f"val/gt_audio_{i}_{process_idx}": wandb.Audio(f"audio/gt_audio_{i}_{process_idx}.wav")
             }, step=global_step)
 
 
@@ -276,6 +293,12 @@ def parse_args():
         default=True,
         action="store_true",
         help="Whether to only run evaluation on the validation set only.",
+    )
+    parser.add_argument(
+        "--eval_seed",
+        type=int,
+        default=42,
+        help="The seed to use for evaluation.",
     )
     parser.add_argument(
         "--scale_factor",
