@@ -230,7 +230,7 @@ def evaluate(
         for i in range(images.shape[0]):
             audios.append(
                 synth(
-                    images[i][batch["frame_mask"][i]].cpu()
+                    denormalize_mel(images[i][batch["frame_mask"][i]]).cpu()
                 )
             )
             # save audio
@@ -286,7 +286,7 @@ def parse_args():
     parser.add_argument(
         "--load_from_checkpoint",
         type=str,
-        default=None,
+        default="mel-norm-eval-fixed/checkpoint-8481",
         help="The path to a checkpoint to load from.",
     )
     parser.add_argument(

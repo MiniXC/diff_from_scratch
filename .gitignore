@@ -3,3 +3,4 @@ conditional_ddpm/
 ddpm-model-64/
 wandb/
 audio/
+checkpoint-*/
