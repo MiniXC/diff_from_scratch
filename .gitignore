@@ -4,3 +4,4 @@ ddpm-model-64/
 wandb/
 audio/
 checkpoint-*/
+*.png

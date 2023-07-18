@@ -271,6 +271,12 @@ def parse_args():
         help="Can be 'mel' or 'vocex'."
     )
     parser.add_argument(
+        "--condition_type",
+        type=str,
+        default="channel",
+        help="Can be 'channel', 'cross-attention' or 'bottleneck'."
+    )
+    parser.add_argument(
         "--cut_epochs_short",
         type=int,
         default=-1,
@@ -290,7 +296,7 @@ def parse_args():
     )
     parser.add_argument(
         "--eval_only",
-        default=True,
+        default=False,
         action="store_true",
         help="Whether to only run evaluation on the validation set only.",
     )
@@ -309,7 +315,7 @@ def parse_args():
     parser.add_argument(
         "--load_from_checkpoint",
         type=str,
-        default="mel-norm-eval-fixed/checkpoint-8481",
+        default=None,
         help="The path to a checkpoint to load from.",
     )
     parser.add_argument(
@@ -593,12 +599,20 @@ def main():
                 # encoder_hid_dim=80,
             )
         else:
-            if args.train_type == "mel":
-                in_channels = 1 + 4 + 4 # noise, phone, vocex
-                kernel_size = 3
-            elif args.train_type == "vocex":
-                in_channels = 1 + 4 # noise, phone
-                kernel_size = 1
+            if args.condition_type == "channel":
+                if args.train_type == "mel":
+                    in_channels = 1 + 4 + 4 # noise, phone, vocex
+                    kernel_size = 3
+                elif args.train_type == "vocex":
+                    in_channels = 1 + 4 # noise, phone
+                    kernel_size = 1
+            elif args.condition_type == "cross-attention":
+                if args.train_type == "mel":
+                    in_channels = 1
+                    kernel_size = 3
+                elif args.train_type == "vocex":
+                    in_channels = 1
+                    kernel_size = 1
             model = UNet2DConditionModel(
                 sample_size=(resolution_x, resolution_y),
                 in_channels=in_channels,
@@ -675,8 +689,12 @@ def main():
 
     if args.is_conditional:
         if args.train_type == "mel":
-            phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=80*4)
-            vocex_projection = Projection(16, 80*4)
+            if args.condition_type == "channel":
+                phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=80*4)
+                vocex_projection = Projection(16, 80*4)
+            elif args.condition_type == "cross-attention":
+                phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=128)
+                vocex_projection = Projection(16, 128)
         elif args.train_type == "vocex":
             phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=16*4)
         condition_projection = Projection(80, 128)
@@ -753,6 +771,7 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {max_train_steps}")
+    logger.info(f"  Model Size (Parameters) = {sum(p.numel() for p in model.parameters())}")
 
     global_step = 0
     first_epoch = 0
@@ -845,10 +864,7 @@ def main():
             condition = batch["speaker_prompt_mel"] # [bsz, length, 80]
 
             condition = normalize_mel(condition)
-            condition = condition
-
-            enc_attn_mask = condition.sum(dim=-1) != 0 # [bsz, length]
-
+            
             # Sample noise that we'll add to the images
             noise = torch.randn(clean_images.shape).to(clean_images.device)
             bsz = clean_images.shape[0]
@@ -863,22 +879,29 @@ def main():
 
 
             if args.is_conditional:
+                # project condition
+                condition = condition_projection(condition)
                 if args.train_type == "mel":
                     phone = batch["phones"]
                     phone = phone_embedding(phone) # [bsz, length, 80*4]
-                    phone = phone.reshape(bsz, 4, -1, 80)
                     vocex = normalize_vocex(batch["vocex"])
                     vocex = vocex_projection(vocex)
-                    vocex = vocex.reshape(bsz, 4, -1, 80)
-                    # combine noise and phone
-                    noisy_images = torch.cat([noisy_images, phone, vocex], dim=1)
+                    if args.condition_type == "channel":
+                        # combine noise and condition
+                        phone = phone.reshape(bsz, 4, -1, 80)
+                        vocex = vocex.reshape(bsz, 4, -1, 80)
+                        noisy_images = torch.cat([noisy_images, phone, vocex], dim=1)
+                    elif args.condition_type == "cross-attention":
+                        # concat condition and vocex and phone
+                        condition = torch.cat([condition, vocex, phone], dim=1)
                 elif args.train_type == "vocex":
                     phone = batch["phones"]
                     phone = phone_embedding(phone)
                     phone = phone.reshape(bsz, 4, -1, 16)
                     noisy_images = torch.cat([noisy_images, phone], dim=1)
-                # project condition
-                condition = condition_projection(condition)
+
+                enc_attn_mask = condition.sum(dim=-1) != 0
+                
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
