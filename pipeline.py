@@ -19,19 +19,20 @@ class DDPMPipeline(DiffusionPipeline):
             [`DDPMScheduler`], or [`DDIMScheduler`].
     """
 
-    def __init__(self, unet, scheduler, conditional=False, is_mel=False, seed=None):
+    def __init__(self, unet, scheduler, conditional=False, is_mel=False, seed=None, is_conformer=False, device=None):
         super().__init__()
         self.register_modules(unet=unet, scheduler=scheduler)
         self.conditional = conditional
         self.is_mel = is_mel
         self.seed = seed
+        self.is_conformer = is_conformer
+        self._device = device
 
     @torch.no_grad()
     def __call__(
         self,
         batch_size: int = 1,
         num_inference_steps: int = 1000,
-        return_dict: bool = True,
         cond: Optional[torch.Tensor] = None,
         phones: Optional[torch.Tensor] = None,
         vocex: Optional[torch.Tensor] = None,
@@ -62,34 +63,46 @@ class DDPMPipeline(DiffusionPipeline):
 
         # Sample gaussian noise to begin loop
         if isinstance(self.unet.config.sample_size, int):
-            image_shape = (
-                batch_size,
-                self.unet.config.in_channels,
-                self.unet.config.sample_size,
-                self.unet.config.sample_size,
-            )
+            if self.is_conformer:
+                image_shape = (
+                    batch_size,
+                    self.unet.config.sample_size,
+                    self.unet.config.sample_size,
+                )
+            else:
+                image_shape = (
+                    batch_size,
+                    self.unet.config.in_channels,
+                    self.unet.config.sample_size,
+                    self.unet.config.sample_size,
+                )
         else:
-            image_shape = (batch_size, 1, *self.unet.config.sample_size)
+            if self.is_conformer:
+                image_shape = (batch_size, *self.unet.config.sample_size)
+            else:
+                image_shape = (batch_size, 1, *self.unet.config.sample_size)
 
-        if self.device.type == "mps":
+        if self._device.type == "mps":
             # randn does not work reproducibly on mps
             image = randn_tensor(image_shape)
-            image = image.to(self.device)
+            image = image.to(self._device)
         else:
-            image = randn_tensor(image_shape, device=self.device)
+            image = randn_tensor(image_shape, device=self._device)
 
         if self.conditional:
             if self.is_mel:
                 height = 80
             else:
                 height = 16
-            phones = phones.reshape(image_shape[0], 4, -1, height)
-            # combine noise and phone
-            if vocex is None:
-                image = torch.cat([image, phones], dim=1)
-            else:
-                vocex = vocex.reshape(image_shape[0], 4, -1, height)
-                image = torch.cat([image, phones, vocex], dim=1)
+            width = self.unet.config.sample_size[0]
+            if not self.is_conformer:
+                phones = phones.reshape(image_shape[0], width, height)
+                # combine noise and phone
+                if vocex is None:
+                    image = torch.cat([image, phones], dim=1)
+                else:
+                    vocex = vocex.reshape(image_shape[0], width, height)
+                    image = torch.cat([image, phones, vocex], dim=1)
 
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
@@ -97,18 +110,35 @@ class DDPMPipeline(DiffusionPipeline):
         for t in self.progress_bar(self.scheduler.timesteps):
             # 1. predict noise model_output
             if self.conditional:
-                model_output = self.unet(
-                    image, 
-                    t,
-                    cond,
-                    encoder_attention_mask=encoder_attention_mask,
-                ).sample
+                if self.is_conformer:
+                    bsz = image.shape[0]
+                    t_condition = torch.cat([phones, vocex], dim=2)
+                    timesteps = t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                    timesteps = timesteps.to(image.device)
+                    noisy_images = image.reshape(bsz, -1, 80)
+                    model_output = self.unet(
+                        noisy_images,
+                        timesteps,
+                        t_condition,
+                        cond,
+                        cond.sum(dim=-1) != 0
+                    )
+                else:
+                    model_output = self.unet(
+                        image, 
+                        t,
+                        cond,
+                        encoder_attention_mask=encoder_attention_mask,
+                    ).sample
             else:
                 model_output = self.unet(image, t).sample
 
             # 2. compute previous image: x_t -> x_t-1
             image = self.scheduler.step(model_output, t, image).prev_sample
 
-        image = image[:, 0]
+        if not self.is_conformer:
+            image = image[:, 0]
+
+        print(image.shape)
         
         return image

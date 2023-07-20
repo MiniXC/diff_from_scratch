@@ -6,6 +6,8 @@ from torch import nn
 from torch.nn import TransformerEncoderLayer
 # multi-head attention
 from torch.nn import MultiheadAttention
+import numpy as np
+import argparse
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000, dropout=0.1):
@@ -38,27 +40,29 @@ class CrossAttention(nn.Module):
             d_model,
             n_heads,
             dropout=dropout,
+            batch_first=True,
         )
         self.dropout = nn.Dropout(dropout)
         self.linear = nn.Linear(d_model, d_model)
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x, y, x_mask=None, y_mask=None):
+    def forward(self, x, y, mask):
         """
         x: (batch_size, seq_len_1, d_model)
         y: (batch_size, seq_len_2, d_model)
         """
-        x = x.transpose(0, 1)
-        y = y.transpose(0, 1)
-        x = self.multihead_attn(
+        # attn_mask (batch_size, seq_len_1, seq_len_2)
+        # construct attn_mask
+        x, _ = self.multihead_attn(
             query=x,
             key=y,
             value=y,
-            key_padding_mask=y_mask,
-        )[0]
+            key_padding_mask=mask,
+            need_weights=False,
+        )
         x = self.dropout(x)
         x = self.norm(x + self.linear(x))
-        return x.transpose(0, 1)
+        return x
 
 # from https://pytorch.org/docs/1.13/_modules/torch/nn/modules/transformer.html#TransformerEncoder
 class TransformerEncoder(nn.Module):
@@ -66,72 +70,34 @@ class TransformerEncoder(nn.Module):
         self,
         encoder_layer,
         num_layers,
-        norm=None,
         return_additional_layers=None,
-        cross_attention=False,
+        d_model=None,
+        n_heads=None,
+        dropout=None,
     ):
         super(TransformerEncoder, self).__init__()
         self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
-        if cross_attention:
-            attn = CrossAttention(
-                encoder_layer.d_model,
-                encoder_layer.n_heads,
-                dropout=encoder_layer.dropout,
-            )
-            self.attentions = nn.ModuleList([copy.deepcopy(attn) for _ in range(num_layers)])
-        self.cross_attention = cross_attention
+        attn = CrossAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout,
+        )
+        self.attentions = nn.ModuleList([copy.deepcopy(attn) for _ in range(num_layers)])
         self.num_layers = num_layers
-        self.norm = norm
+        self.norm = nn.LayerNorm(d_model)
         self.return_additional_layers = return_additional_layers
 
-    def forward(self, src, mask=None, src_key_padding_mask=None, t_condition=None, c_condition=None, need_weights=False):
-            if src_key_padding_mask is not None:
-                _skpm_dtype = src_key_padding_mask.dtype
-                if _skpm_dtype != torch.bool and not torch.is_floating_point(src_key_padding_mask):
-                    raise AssertionError("only bool and floating types of key_padding_mask are supported")
-            
+    def forward(self, src, mask=None, src_key_padding_mask=None, t_condition=None, c_condition=None, c_mask=None):            
             output = src
-            src_key_padding_mask_for_layers = src_key_padding_mask
-
-            output_for_return = []
-
-            if need_weights:
-                weight_list = []
 
             for i, mod in enumerate(self.layers):
-                if t_condition is not None:
-                    output = output + t_condition
-                if need_weights:
-                    output, weights = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask_for_layers, need_weights=need_weights)
-                    weight_list.append(weights)
-                else:
-                    output = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask_for_layers)
-                if self.return_additional_layers is not None and i in self.return_additional_layers:
-                    output_for_return.append(output)
+                output = output + t_condition
+                output = self.attentions[i](output, c_condition, c_mask)
+                output = mod(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
 
-            if self.norm is not None:
-                output = self.norm(output)
+            output = self.norm(output)
 
-            if self.return_additional_layers is not None:
-                if need_weights:
-                    return {
-                        "output": output,
-                        "activations": output_for_return,
-                        "attention": weight_list,
-                    }
-                else:
-                    return {
-                        "output": output,
-                        "activations": output_for_return,
-                    }
-            else:
-                if need_weights:
-                    return {
-                        "output": output,
-                        "attention": weight_list,
-                    }
-                else:
-                    return output
+            return output
 
 class DepthwiseConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1):
@@ -177,26 +143,17 @@ class ConformerLayer(TransformerEncoderLayer):
                 padding=(kwargs["conv_kernel"][1] - 1) // 2,
             )
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None, need_weights=False):
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
         x = src
         if self.norm_first:
-            if not need_weights:
-                attn = self._sa_block(self.norm1(x), src_mask, src_key_padding_mask)
-            else:
-                attn, weights = self._sa_block(self.norm1(x), src_mask, src_key_padding_mask, need_weights=need_weights)
+            attn = self._sa_block(self.norm1(x), src_mask, src_key_padding_mask)
             x = x + attn
             x = x + self._ff_block(self.norm2(x))
         else:
-            if not need_weights:
-                attn = self._sa_block(x, src_mask, src_key_padding_mask)
-            else:
-                attn, weights = self._sa_block(x, src_mask, src_key_padding_mask, need_weights=need_weights)
+            attn = self._sa_block(x, src_mask, src_key_padding_mask)
             x = self.norm1(x + attn)
             x = self.norm2(x + self._ff_block(x))
-        if need_weights:
-            return x, weights
-        else:
-            return x
+        return x
 
     def _ff_block(self, x):
         x = self.conv2(
@@ -209,22 +166,48 @@ class ConformerLayer(TransformerEncoderLayer):
             x,
             attn_mask,
             key_padding_mask=None,
-            need_weights=False,
         ):
-        if not need_weights:
             x = self.self_attn(x, x, x,
                             attn_mask=attn_mask,
                             key_padding_mask=key_padding_mask,
-                            need_weights=need_weights)[0]
-        else:
-            x, weights = self.self_attn(x, x, x,
-                            attn_mask=attn_mask,
-                            key_padding_mask=key_padding_mask,
-                            need_weights=need_weights)
-        if need_weights:
-            return self.dropout1(x), weights
-        else:
+                            need_weights=False)[0]
             return self.dropout1(x)
+
+class TimestepEmbedding(nn.Module):
+    def __init__(self, dim_in, dim_hidden, dim_out):
+        super().__init__()
+        self.fc_t1 = nn.Linear(
+            dim_in,
+            dim_hidden,
+        )
+        self.fc_t2 = nn.Linear(
+            dim_hidden,
+            dim_out,
+        )
+        self.dim_in = dim_in
+
+        # init
+        nn.init.xavier_uniform_(self.fc_t1.weight)
+        nn.init.xavier_uniform_(self.fc_t2.weight)
+        nn.init.zeros_(self.fc_t1.bias)
+        nn.init.zeros_(self.fc_t2.bias)
+
+    @staticmethod
+    def swish(x):
+        return x * torch.sigmoid(x)
+
+    def forward(self, steps):
+        half_dim = self.dim_in // 2
+        _embed = np.log(10000) / (half_dim - 1)
+        _embed = torch.exp(torch.arange(half_dim) * -_embed)
+        _embed = steps * _embed
+        diff_embed = torch.cat(
+            (torch.sin(_embed), torch.cos(_embed)),
+            2
+        ).to(steps.device)
+        diff_embed = TimestepEmbedding.swish(self.fc_t1(diff_embed))
+        diff_embed = TimestepEmbedding.swish(self.fc_t2(diff_embed))
+        return diff_embed
         
 class ConformerModel(nn.Module):
 
@@ -237,12 +220,15 @@ class ConformerModel(nn.Module):
         dropout=0.1,
         depthwise=True,
         n_layers=8,
+        sample_size=(512, 80),
     ):
         super().__init__()
         
         self.in_layer = nn.Linear(in_channels, filter_size)
 
         self.positional_encoding = PositionalEncoding(filter_size)
+
+        self.time_embedding = TimestepEmbedding(10, filter_size, filter_size)
 
         self.layers = TransformerEncoder(
             ConformerLayer(
@@ -256,6 +242,9 @@ class ConformerModel(nn.Module):
                 conv_depthwise=depthwise,
             ),
             num_layers=n_layers,
+            d_model=filter_size,
+            n_heads=n_heads,
+            dropout=dropout,
         )
 
         self.linear = nn.Sequential(
@@ -269,7 +258,7 @@ class ConformerModel(nn.Module):
         self.apply(self._init_weights)
 
         # save hparams
-        self.hparams = {
+        self.config = {
             "in_channels": in_channels,
             "filter_size": filter_size,
             "n_heads": n_heads,
@@ -277,7 +266,9 @@ class ConformerModel(nn.Module):
             "dropout": dropout,
             "depthwise": depthwise,
             "n_layers": n_layers,
+            "sample_size": sample_size,
         }
+        self.config = argparse.Namespace(**self.config)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -288,104 +279,25 @@ class ConformerModel(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, x, speaker_prompt=None, phones=None, vocex=None):
+    def forward(self, x, timestep, t_condition=None, c_condition=None, c_mask=None):
         padding_mask = x.sum(dim=-1) != 0
         padding_mask = padding_mask.to(x.dtype)
 
+        step_embed = self.time_embedding(timestep)
+
+        t_condition = t_condition + step_embed
+
         out = self.in_layer(x)
         out = self.positional_encoding(out)
-        res = self.layers(out, src_key_padding_mask=mel_padding_mask)
-        out = self.linear(out_conv)
-        out = out.transpose(1, 2)
 
-        measure_results = {}
-        measure_true = {}
-        loss_dict = {}
-        for i, measure in enumerate(self.measures):
-            measure_out = out[:, i]
-            if not measure.endswith("_binary") and not self.scalers[measure].is_fit:
-                self.scalers[measure].partial_fit(measures[measure])
-            measure_results[measure] = measure_out
-        if measures is not None:
-            loss_dict = {}
-            for measure in self.measures:
-                if not measure.endswith("_binary"):
-                    measure_true[measure] = self.scalers[measure].transform(measures[measure])
-                else:
-                    measure_true[measure] = measures[measure]
-            measures_losses = []
-            for measure in self.measures:
-                if measure.endswith("_binary"):
-                    m_loss = nn.BCEWithLogitsLoss()(measure_results[measure]*mel_padding_mask, measure_true[measure]*mel_padding_mask)
-                else:
-                    if not self.use_softdtw:
-                        m_loss = nn.MSELoss()(measure_results[measure]*mel_padding_mask, measure_true[measure]*mel_padding_mask)
-                    else:
-                        if self.verbose:
-                            print(measure_results[measure], measure_true[measure])
-                        m_loss = self.softdtw(
-                            measure_results[measure]*mel_padding_mask,
-                            measure_true[measure]*mel_padding_mask,
-                        ) / 1000
-                loss_dict[measure] = m_loss
-                measures_losses.append(m_loss)
-            loss = sum(measures_losses) / len(self.measures)
-        else:
-            loss = None
-        ### d-vector
-        # predict d-vector using global average and max pooling as input
-        out_conv_dvec = self.dvector_conv_in_layer(out_conv)
-        x = self.dvector_x_in_layer(x)
-        out_dvec = self.dvector_layers(out_conv_dvec + x, src_key_padding_mask=mel_padding_mask)
-        dvector_input = torch.cat(
-            [
-                torch.mean(out_dvec, dim=1),
-                torch.max(out_dvec, dim=1)[0],
-            ],
-            dim=1,
+        out = self.layers(
+            out,
+            src_key_padding_mask=padding_mask,
+            t_condition=t_condition,
+            c_condition=c_condition,
+            c_mask=c_mask
         )
-        dvector_pred = self.dvector_linear(dvector_input)
-        if dvector is not None:
-            if not self.scalers["dvector"].is_fit:
-                self.scalers["dvector"].partial_fit(dvector)
-            true_dvector = self.scalers["dvector"].transform(dvector)
-            dvector_loss = nn.L1Loss()(dvector_pred, true_dvector)
-            loss_dict["dvector"] = dvector_loss
-            if loss is not None:
-                loss += dvector_loss
-                loss /= 2
-            else:
-                loss = dvector_loss
-        if (not inference) and not (hasattr(self, "onnx_export") and self.onnx_export):
-            results = {
-                "loss": loss,
-                "compound_losses": loss_dict,
-            }
-            if return_activations:
-                results["activations"] = [a.detach() for a in activations]
-            if return_attention:
-                results["attention"] = [a.detach() for a in attention]
-            return results
-        else:
-            # transform back to original scale
-            for measure in self.measures:
-                if not measure.endswith("_binary"):
-                    measure_results[measure] = self.scalers[measure].inverse_transform(
-                        measure_results[measure]
-                    )
-                else:
-                    measure_results[measure] = torch.sigmoid(measure_results[measure]).detach()
-            dvector_pred = self.scalers["dvector"].inverse_transform(dvector_pred)
-            if is_onnx:
-                return [measure_results[measure] for measure in self.measures] + [dvector_pred]
-            results = {
-                "loss": loss,
-                "compound_losses": loss_dict,
-                "measures": measure_results,
-                "dvector": dvector_pred,
-            }
-            if return_activations:
-                results["activations"] = [a.detach() for a in activations]
-            if return_attention:
-                results["attention"] = [a.detach() for a in attention]
-            return results
+        out = self.linear(out)
+        out = out
+
+        return out

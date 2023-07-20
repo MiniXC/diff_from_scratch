@@ -27,13 +27,14 @@ from vocex import Vocex
 from hifigan import Synthesiser
 import wandb
 
+from conformer_model import ConformerModel
+
 # from augmentations import wave_augmentation_func
 
 import diffusers
 from diffusers import DDPMScheduler, UNet2DModel, UNet2DConditionModel # DDPMPipeline
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
-from pipeline import DDPMPipeline
 from pipeline import DDPMPipeline
 
 from speech_collator import SpeechCollator
@@ -111,6 +112,10 @@ def evaluate(
         vocex_projection,
         phone2idx=None,
     ):
+
+    if accelerator.is_main_process:
+        accelerator.get_tracker("wandb").log({"val/epoch": epoch}, step=global_step)
+
     unet = accelerator.unwrap_model(model)
     synth = Synthesiser()
 
@@ -120,12 +125,16 @@ def evaluate(
             scheduler=noise_scheduler,
             conditional=True,
             is_mel=args.train_type == "mel",
+            device=accelerator.device,
+            is_conformer=args.model_type == "conformer",
         )
     else:
         pipeline = DDPMPipeline(
             unet=unet,
             scheduler=noise_scheduler,
             conditional=False,
+            device=accelerator.device,
+            is_conformer=args.model_type == "conformer",
         )
 
     mse_losses = []
@@ -275,6 +284,12 @@ def parse_args():
         type=str,
         default="channel",
         help="Can be 'channel', 'cross-attention' or 'bottleneck'."
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="unet",
+        help="Can be 'unet' or 'conformer'."
     )
     parser.add_argument(
         "--cut_epochs_short",
@@ -613,38 +628,44 @@ def main():
                 elif args.train_type == "vocex":
                     in_channels = 1
                     kernel_size = 1
-            model = UNet2DConditionModel(
-                sample_size=(resolution_x, resolution_y),
-                in_channels=in_channels,
-                out_channels=1,
-                layers_per_block=2,
-                conv_in_kernel=kernel_size,
-                conv_out_kernel=kernel_size,
-                block_out_channels=(
-                    64,
-                    64,
-                    128,
-                    256,
-                    512,
-                ),
-                down_block_types=(
-                    "DownBlock2D",
-                    "DownBlock2D",
-                    "DownBlock2D",
-                    # "DownBlock2D",
-                    "AttnDownBlock2D",
-                    "DownBlock2D",
-                ),
-                up_block_types=(
-                    "UpBlock2D",
-                    "AttnUpBlock2D",
-                    # "UpBlock2D",
-                    "UpBlock2D",
-                    "UpBlock2D",
-                    "UpBlock2D",
-                ),
-                cross_attention_dim=128,
-            )
+            if args.model_type == "unet":
+                model = UNet2DConditionModel(
+                    sample_size=(resolution_x, resolution_y),
+                    in_channels=in_channels,
+                    out_channels=1,
+                    layers_per_block=2,
+                    conv_in_kernel=kernel_size,
+                    conv_out_kernel=kernel_size,
+                    block_out_channels=(
+                        64,
+                        64,
+                        128,
+                        256,
+                        512,
+                    ),
+                    down_block_types=(
+                        "DownBlock2D",
+                        "DownBlock2D",
+                        "DownBlock2D",
+                        # "DownBlock2D",
+                        "AttnDownBlock2D",
+                        "DownBlock2D",
+                    ),
+                    up_block_types=(
+                        "UpBlock2D",
+                        "AttnUpBlock2D",
+                        # "UpBlock2D",
+                        "UpBlock2D",
+                        "UpBlock2D",
+                        "UpBlock2D",
+                    ),
+                    cross_attention_dim=128,
+                )
+            elif args.model_type == "conformer":
+                model = ConformerModel(
+                    sample_size=(resolution_x, resolution_y),
+                    depthwise=False,
+                )
     else:
         if not args.is_conditional:
             config = UNet2DModel.load_config(args.model_config_name_or_path)
@@ -689,15 +710,22 @@ def main():
 
     if args.is_conditional:
         if args.train_type == "mel":
-            if args.condition_type == "channel":
-                phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=80*4)
-                vocex_projection = Projection(16, 80*4)
-            elif args.condition_type == "cross-attention":
-                phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=128)
-                vocex_projection = Projection(16, 128)
+            if args.model_type == "unet":
+                if args.condition_type == "channel":
+                    phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=80*4)
+                    vocex_projection = Projection(16, 80*4)
+                elif args.condition_type == "cross-attention":
+                    phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=128)
+                    vocex_projection = Projection(16, 128)
+            elif args.model_type == "conformer":
+                phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=256)
+                vocex_projection = Projection(16, 256)
         elif args.train_type == "vocex":
             phone_embedding = PhoneEmbedding(phone2idx, embedding_dim=16*4)
-        condition_projection = Projection(80, 128)
+        if args.model_type=="unet":
+            condition_projection = Projection(80, 128)
+        elif args.model_type=="conformer":
+            condition_projection = Projection(80, 512)
 
     vocex_model = Vocex.from_pretrained("cdminix/vocex").model.to("cpu")
 
@@ -886,14 +914,15 @@ def main():
                     phone = phone_embedding(phone) # [bsz, length, 80*4]
                     vocex = normalize_vocex(batch["vocex"])
                     vocex = vocex_projection(vocex)
-                    if args.condition_type == "channel":
-                        # combine noise and condition
-                        phone = phone.reshape(bsz, 4, -1, 80)
-                        vocex = vocex.reshape(bsz, 4, -1, 80)
-                        noisy_images = torch.cat([noisy_images, phone, vocex], dim=1)
-                    elif args.condition_type == "cross-attention":
-                        # concat condition and vocex and phone
-                        condition = torch.cat([condition, vocex, phone], dim=1)
+                    if args.model_type != "conformer":
+                        if args.condition_type == "channel":
+                            # combine noise and condition
+                            phone = phone.reshape(bsz, 4, -1, 80)
+                            vocex = vocex.reshape(bsz, 4, -1, 80)
+                            noisy_images = torch.cat([noisy_images, phone, vocex], dim=1)
+                        elif args.condition_type == "cross-attention":
+                            # concat condition and vocex and phone
+                            condition = torch.cat([condition, vocex, phone], dim=1)
                 elif args.train_type == "vocex":
                     phone = batch["phones"]
                     phone = phone_embedding(phone)
@@ -906,13 +935,26 @@ def main():
             with accelerator.accumulate(model):
                 # Predict the noise residual
                 if args.is_conditional:
-                    model_output = model(
-                        noisy_images,
-                        timesteps,
-                        condition,
-                        #attention_mask=attn_mask,
-                        encoder_attention_mask=enc_attn_mask
-                    ).sample
+                    if args.model_type == "unet":
+                        model_output = model(
+                            noisy_images,
+                            timesteps,
+                            condition,
+                            #attention_mask=attn_mask,
+                            encoder_attention_mask=enc_attn_mask
+                        ).sample
+                    elif args.model_type == "conformer":
+                        # concat in channel dim (phones & vocex)
+                        t_condition = torch.cat([phone, vocex], dim=2)
+                        timesteps = timesteps.unsqueeze(-1).unsqueeze(-1)
+                        noisy_images = noisy_images.reshape(bsz, -1, 80)
+                        model_output = model(
+                            noisy_images,
+                            timesteps,
+                            t_condition,
+                            condition,
+                            enc_attn_mask
+                        )
                 else:
                     model_output = model(
                         noisy_images,
@@ -920,6 +962,8 @@ def main():
                     ).sample
 
                 if args.prediction_type == "epsilon":
+                    if args.model_type == "conformer":
+                        noise = noise.reshape(bsz, -1, 80)
                     loss = F.mse_loss(model_output, noise, reduction="none")
                     loss = loss * attn_mask.unsqueeze(-1)
                     loss = loss.mean()
@@ -982,11 +1026,6 @@ def main():
 
             # save the model
             unet = accelerator.unwrap_model(model)
-
-            pipeline = DDPMPipeline(
-                unet=unet,
-                scheduler=noise_scheduler,
-            )
 
             accelerator.save_state(os.path.join(args.model_id, f"checkpoint-{global_step}"))
 
