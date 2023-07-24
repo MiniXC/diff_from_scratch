@@ -1,4 +1,5 @@
 accelerate launch training.py \
---wandb_mode=offline \
+--wandb_mode=online \
 --model_type=conformer \
---eval_only
+--no_eval \
+--model_id=conformer_postnet_16l

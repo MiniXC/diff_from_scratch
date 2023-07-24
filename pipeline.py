@@ -139,6 +139,4 @@ class DDPMPipeline(DiffusionPipeline):
         if not self.is_conformer:
             image = image[:, 0]
 
-        print(image.shape)
-        
         return image

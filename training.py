@@ -113,6 +113,9 @@ def evaluate(
         phone2idx=None,
     ):
 
+    if args.no_eval:
+        return
+
     if accelerator.is_main_process:
         accelerator.get_tracker("wandb").log({"val/epoch": epoch}, step=global_step)
 
@@ -314,6 +317,12 @@ def parse_args():
         default=False,
         action="store_true",
         help="Whether to only run evaluation on the validation set only.",
+    )
+    parser.add_argument(
+        "--no_eval",
+        default=False,
+        action="store_true",
+        help="Whether to skip evaluation.",
     )
     parser.add_argument(
         "--eval_seed",
@@ -665,6 +674,7 @@ def main():
                 model = ConformerModel(
                     sample_size=(resolution_x, resolution_y),
                     depthwise=False,
+                    n_layers=16,
                 )
     else:
         if not args.is_conditional:
@@ -742,7 +752,7 @@ def main():
         ds_train,
         batch_size=args.train_batch_size,
         collate_fn=collator.collate_fn,
-        num_workers=0,#args.dataloader_num_workers,
+        num_workers=args.dataloader_num_workers,
         shuffle=True,
     )
 
@@ -846,6 +856,8 @@ def main():
             phone2idx,
         )
         accelerator.wait_for_everyone()
+
+    last_loss = None
 
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
@@ -997,7 +1009,10 @@ def main():
                 losses.append(loss)
                 if global_step % args.log_loss_every == 0:
                     logs["loss"] = torch.mean(torch.tensor(losses)).item()
+                    last_loss = logs["loss"]
                     losses = []
+                else:
+                    logs["loss"] = last_loss
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
         progress_bar.close()

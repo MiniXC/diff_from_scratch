@@ -53,15 +53,15 @@ class CrossAttention(nn.Module):
         """
         # attn_mask (batch_size, seq_len_1, seq_len_2)
         # construct attn_mask
+        _x = x
         x, _ = self.multihead_attn(
             query=x,
             key=y,
             value=y,
-            key_padding_mask=mask,
-            need_weights=False,
+            #key_padding_mask=mask,
         )
         x = self.dropout(x)
-        x = self.norm(x + self.linear(x))
+        x = self.norm(self.linear(x) + _x)
         return x
 
 # from https://pytorch.org/docs/1.13/_modules/torch/nn/modules/transformer.html#TransformerEncoder
@@ -70,7 +70,6 @@ class TransformerEncoder(nn.Module):
         self,
         encoder_layer,
         num_layers,
-        return_additional_layers=None,
         d_model=None,
         n_heads=None,
         dropout=None,
@@ -85,7 +84,6 @@ class TransformerEncoder(nn.Module):
         self.attentions = nn.ModuleList([copy.deepcopy(attn) for _ in range(num_layers)])
         self.num_layers = num_layers
         self.norm = nn.LayerNorm(d_model)
-        self.return_additional_layers = return_additional_layers
 
     def forward(self, src, mask=None, src_key_padding_mask=None, t_condition=None, c_condition=None, c_mask=None):            
             output = src
@@ -221,14 +219,21 @@ class ConformerModel(nn.Module):
         depthwise=True,
         n_layers=8,
         sample_size=(512, 80),
+        n_layers_postnet=5,
+        postnet_filter_size=32,
     ):
         super().__init__()
         
         self.in_layer = nn.Linear(in_channels, filter_size)
+        self.residual_in_layer = nn.Linear(in_channels, in_channels)
 
         self.positional_encoding = PositionalEncoding(filter_size)
 
         self.time_embedding = TimestepEmbedding(10, filter_size, filter_size)
+        self.t_in_layer = nn.Linear(filter_size, filter_size)
+        self.residual_t_in_layer = nn.Linear(filter_size, in_channels)
+
+        self.c_in_layer = nn.Linear(filter_size, filter_size)
 
         self.layers = TransformerEncoder(
             ConformerLayer(
@@ -246,6 +251,41 @@ class ConformerModel(nn.Module):
             n_heads=n_heads,
             dropout=dropout,
         )
+
+        # 2d convolutions for postnet
+        self.postnet = nn.ModuleList()
+        self.postnet_in_layer = nn.Conv2d(
+            in_channels=1,
+            out_channels=postnet_filter_size,
+            kernel_size=(5, 5),
+            padding=(2, 2),
+            bias=False,
+        )
+        for _ in range(n_layers_postnet):
+            self.postnet.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        in_channels=postnet_filter_size,
+                        out_channels=postnet_filter_size,
+                        kernel_size=(5, 5),
+                        padding=(2, 2),
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(postnet_filter_size),
+                    nn.ReLU(),
+                )
+            )
+
+        self.postnet.append(
+            nn.Conv2d(
+                in_channels=postnet_filter_size,
+                out_channels=1,
+                kernel_size=(5, 5),
+                padding=(2, 2),
+                bias=False,
+            )
+        )
+
 
         self.linear = nn.Sequential(
             nn.Linear(filter_size, 512),
@@ -285,10 +325,12 @@ class ConformerModel(nn.Module):
 
         step_embed = self.time_embedding(timestep)
 
-        t_condition = t_condition + step_embed
+        t_condition = self.t_in_layer(t_condition + step_embed)
+        c_condition = self.c_in_layer(c_condition)
 
         out = self.in_layer(x)
         out = self.positional_encoding(out)
+
 
         out = self.layers(
             out,
@@ -297,7 +339,23 @@ class ConformerModel(nn.Module):
             c_condition=c_condition,
             c_mask=c_mask
         )
+
         out = self.linear(out)
-        out = out
+
+        # first, add residual connection
+        out = out + self.residual_in_layer(x) + self.residual_t_in_layer(t_condition + step_embed)
+        # shape (batch_size, seq_len, in_channels)
+
+        # reshape to 2d
+        out = out.unsqueeze(1)
+        # shape (batch_size, 1, seq_len, in_channels)
+
+        # postnet
+        out = self.postnet_in_layer(out)
+        for postnet in self.postnet:
+            out = postnet(out)
+        # shape (batch_size, 1, seq_len, in_channels)
+
+        out = out.squeeze(1)
 
         return out
