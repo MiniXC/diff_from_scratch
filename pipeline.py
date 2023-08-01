@@ -103,6 +103,7 @@ class DDPMPipeline(DiffusionPipeline):
                 else:
                     vocex = vocex.reshape(image_shape[0], width, height)
                     image = torch.cat([image, phones, vocex], dim=1)
+                image = image.to(self._device)
 
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
@@ -113,7 +114,8 @@ class DDPMPipeline(DiffusionPipeline):
                 if self.is_conformer:
                     bsz = image.shape[0]
                     t_condition = torch.cat([phones, vocex], dim=2)
-                    timesteps = t.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                    timesteps = t.unsqueeze(-1).unsqueeze(-1)
+                    timesteps = timesteps.repeat(bsz, 1, 1)
                     timesteps = timesteps.to(image.device)
                     noisy_images = image.reshape(bsz, -1, 80)
                     model_output = self.unet(
@@ -122,19 +124,19 @@ class DDPMPipeline(DiffusionPipeline):
                         t_condition,
                         cond,
                         cond.sum(dim=-1) != 0
-                    )
+                    ).to(self._device)
                 else:
                     model_output = self.unet(
                         image, 
                         t,
                         cond,
                         encoder_attention_mask=encoder_attention_mask,
-                    ).sample
+                    ).sample.to(self._device)
             else:
-                model_output = self.unet(image, t).sample
+                model_output = self.unet(image, t).sample.to(self._device)
 
             # 2. compute previous image: x_t -> x_t-1
-            image = self.scheduler.step(model_output, t, image).prev_sample
+            image = self.scheduler.step(model_output, t, image).prev_sample.to(self._device)
 
         if not self.is_conformer:
             image = image[:, 0]

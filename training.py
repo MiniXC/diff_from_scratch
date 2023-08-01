@@ -99,6 +99,94 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
         res = res[..., None]
     return res.expand(broadcast_shape)
 
+def evaluate_mse_only(
+        model,
+        args,
+        accelerator,
+        epoch,
+        noise_scheduler,
+        global_step,
+        eval_dataloader,
+        phone_embedding,
+        condition_projection,
+        vocex_projection,
+        phone2idx=None,
+    ):
+    
+    if args.no_eval:
+        return
+    
+    if accelerator.is_main_process:
+        accelerator.get_tracker("wandb").log({"val/epoch": epoch}, step=global_step)
+
+    unet = accelerator.unwrap_model(model)
+
+    if args.is_conditional:
+        pipeline = DDPMPipeline(
+            unet=unet,
+            scheduler=noise_scheduler,
+            conditional=True,
+            is_mel=args.train_type == "mel",
+            device=accelerator.device,
+            is_conformer=args.model_type == "conformer",
+        )
+    else:
+        pipeline = DDPMPipeline(
+            unet=unet,
+            scheduler=noise_scheduler,
+            conditional=False,
+            device=accelerator.device,
+            is_conformer=args.model_type == "conformer",
+        )
+
+    mse_losses = []
+
+    if accelerator.is_main_process:
+
+        # run pipeline in inference (sample random noise and denoise)
+        if args.is_conditional:
+            # get conditions
+            for batch in eval_dataloader:
+                condition = batch["speaker_prompt_mel"]
+                condition = normalize_mel(condition)
+                with torch.no_grad():
+                    condition = condition_projection(condition)
+                enc_attn_mask = condition.sum(dim=-1) != 0
+                val_phone = phone_embedding(batch["phones"])
+                if args.train_type == "vocex":
+                    images = pipeline(
+                        batch_size=args.eval_batch_size,
+                        num_inference_steps=args.ddpm_num_inference_steps,
+                        cond=condition,
+                        phones=val_phone,
+                        encoder_attention_mask=enc_attn_mask,
+                    )
+                    mask_size = batch["phone_mask"].sum()
+                    images = denormalize_vocex(images) * batch["phone_mask"].unsqueeze(-1)
+                    gt = batch["vocex"] * batch["phone_mask"].unsqueeze(-1)
+                    mse = ((images - gt) ** 2).sum() / mask_size
+                    mse_losses.append(mse)
+                elif args.train_type == "mel":
+                    val_vocex = vocex_projection(normalize_vocex(batch["vocex"]))
+                    images = pipeline(
+                        batch_size=args.eval_batch_size,
+                        num_inference_steps=args.ddpm_num_inference_steps,
+                        cond=condition,
+                        phones=val_phone,
+                        vocex=val_vocex,
+                        encoder_attention_mask=enc_attn_mask,
+                    )
+                    images = denormalize_mel(images).detach() * batch["frame_mask"].unsqueeze(-1)
+                    gt = batch["mel"] * batch["frame_mask"].unsqueeze(-1)
+                    mse = ((images - gt) ** 2).mean() * (batch["frame_mask"].sum() / batch["frame_mask"].numel())
+                    mse_losses.append(mse)
+                    break
+
+        if len(mse_losses) > 0:
+            mse_losses = mse_losses[0]
+            print(f"mse loss: {mse_losses}")
+            accelerator.get_tracker("wandb").log({"val/mse_loss": mse_losses}, step=global_step)
+
 def evaluate(
         model, 
         args, 
@@ -476,7 +564,7 @@ def parse_args():
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_num_inference_steps", type=int, default=50)
+    parser.add_argument("--ddpm_num_inference_steps", type=int, default=100)
     parser.add_argument("--ddpm_beta_schedule", type=str, default="sigmoid")
     parser.add_argument(
         "--checkpointing_steps",
@@ -511,7 +599,7 @@ def parse_args():
         default=None,
         help=(
             "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+            ' `--checkpointing_steps`, or `"latest"` to automatically select the eval_batch_sizelast available checkpoint.'
         ),
     )
 
@@ -709,9 +797,8 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    dataset = load_dataset("cdminix/libritts-r-aligned")
-    ds_train = dataset["train"]
-    ds_val = dataset["dev"]
+    ds_train = load_dataset("cdminix/libritts-r-aligned", split="train")
+    ds_val = load_dataset("cdminix/libritts-r-aligned", split="dev[:1%]")
 
     with open("data/speaker2idx.json", "r") as f:
         speaker2idx = json.load(f)
@@ -760,7 +847,7 @@ def main():
         ds_val,
         batch_size=args.eval_batch_size,
         collate_fn=collator.collate_fn,
-        num_workers=0,
+        num_workers=args.dataloader_num_workers,
         shuffle=False,
     )
 
@@ -803,7 +890,7 @@ def main():
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(dataset)}")
+    logger.info(f"  Num examples = {len(ds_train)}")
     logger.info(f"  Num Epochs = {args.num_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -815,6 +902,8 @@ def main():
     first_epoch = 0
 
     losses = []
+    intermediate_losses = []
+    final_losses = []
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -855,9 +944,25 @@ def main():
             vocex_projection,
             phone2idx,
         )
+        # evaluate_mse_only(
+        #     model,
+        #     args,
+        #     accelerator,
+        #     0,
+        #     noise_scheduler,
+        #     0,
+        #     eval_dataloader,
+        #     phone_embedding,
+        #     condition_projection,
+        #     vocex_projection,
+        #     phone2idx,
+        # )
         accelerator.wait_for_everyone()
+        return
 
     last_loss = None
+    last_intermediate_loss = None
+    last_final_loss = None
 
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
@@ -960,12 +1065,13 @@ def main():
                         t_condition = torch.cat([phone, vocex], dim=2)
                         timesteps = timesteps.unsqueeze(-1).unsqueeze(-1)
                         noisy_images = noisy_images.reshape(bsz, -1, 80)
-                        model_output = model(
+                        model_output_inter, model_output_final = model(
                             noisy_images,
                             timesteps,
                             t_condition,
                             condition,
-                            enc_attn_mask
+                            enc_attn_mask,
+                            return_intermediate=True,
                         )
                 else:
                     model_output = model(
@@ -976,18 +1082,23 @@ def main():
                 if args.prediction_type == "epsilon":
                     if args.model_type == "conformer":
                         noise = noise.reshape(bsz, -1, 80)
-                    loss = F.mse_loss(model_output, noise, reduction="none")
-                    loss = loss * attn_mask.unsqueeze(-1)
-                    loss = loss.mean()
+                    loss_inter = F.mse_loss(model_output_inter, noise, reduction="none")
+                    loss_inter = loss_inter * attn_mask.unsqueeze(-1)
+                    loss_final = F.mse_loss(model_output_final, noise, reduction="none")
+                    loss_final = loss_final * attn_mask.unsqueeze(-1)
+                    loss = (loss_inter.mean() + loss_final.mean()) / 2
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
                     )
                     snr_weights = alpha_t / (1 - alpha_t)
-                    loss = snr_weights * F.mse_loss(
-                        model_output, clean_images, reduction="none"
-                    )  # use SNR weighting from distillation paper
-                    loss = loss.mean()
+                    loss_inter = snr_weights * F.mse_loss(
+                        model_output_inter, clean_images, reduction="none"
+                    ) 
+                    loss_final = snr_weights * F.mse_loss(
+                        model_output_final, clean_images, reduction="none"
+                    )
+                    loss = (loss_inter.mean() + loss_final.mean()) / 2
                 else:
                     raise ValueError(f"Unsupported prediction type: {args.prediction_type}")
 
@@ -1007,12 +1118,22 @@ def main():
             logs = {"lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             if args.log_loss_every != 0:
                 losses.append(loss)
+                intermediate_losses.append(loss_inter.mean())
+                final_losses.append(loss_final.mean())
                 if global_step % args.log_loss_every == 0:
                     logs["loss"] = torch.mean(torch.tensor(losses)).item()
+                    logs["inter_loss"] = torch.mean(torch.tensor(intermediate_losses)).item()
+                    logs["final_loss"] = torch.mean(torch.tensor(final_losses)).item()
                     last_loss = logs["loss"]
+                    last_intermediate_loss = logs["inter_loss"]
+                    last_final_loss = logs["final_loss"]
                     losses = []
+                    intermediate_losses = []
+                    final_losses = []
                 else:
                     logs["loss"] = last_loss
+                    logs["inter_loss"] = last_intermediate_loss
+                    logs["final_loss"] = last_final_loss
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
         progress_bar.close()
@@ -1021,7 +1142,19 @@ def main():
 
         # Generate sample images for visual inspection
         if (epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1):
-            evaluate(
+            # evaluate(
+            #     model,
+            #     args,
+            #     accelerator,
+            #     epoch,
+            #     noise_scheduler,
+            #     global_step,
+            #     eval_dataloader,
+            #     phone_embedding,
+            #     condition_projection,
+            #     vocex_projection,
+            # )
+            evaluate_mse_only(
                 model,
                 args,
                 accelerator,
@@ -1032,6 +1165,7 @@ def main():
                 phone_embedding,
                 condition_projection,
                 vocex_projection,
+                phone2idx,
             )
 
         accelerator.wait_for_everyone()
