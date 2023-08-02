@@ -5,3 +5,4 @@ wandb/
 audio/
 checkpoint-*/
 *.png
+*.zip

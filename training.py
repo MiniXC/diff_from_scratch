@@ -979,24 +979,6 @@ def main():
     last_intermediate_loss = None
     last_final_loss = None
 
-    # random init model.postnet
-    model = accelerator.unwrap_model(model)
-    for p in model.postnet.parameters():
-        p.data = torch.randn_like(p.data) * 0.01
-    for p in model.postnet_linear.parameters():
-        p.data = torch.randn_like(p.data) * 0.01
-    for p in model.postnet_in_layer.parameters():
-        p.data = torch.randn_like(p.data) * 0.01
-    for p in model.residual_in_layer.parameters():
-        p.data = torch.randn_like(p.data) * 0.01
-    for p in model.residual_t_in_layer.parameters():
-        p.data = torch.randn_like(p.data) * 0.01
-    for p in model.residual_time_in_layer.parameters():
-        p.data = torch.randn_like(p.data) * 0.01
-
-    model = accelerator.prepare(model)
-
-
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
         model.train()

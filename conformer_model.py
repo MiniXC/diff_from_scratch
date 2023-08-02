@@ -220,8 +220,9 @@ class ConformerModel(nn.Module):
         n_layers=8,
         sample_size=(512, 80),
         n_layers_postnet=6,
-        postnet_filter_size=32,
-        postnet_dropout=0,
+        postnet_filter_size=128,
+        postnet_dropout=0.1,
+        postnet_in_channels=128,
     ):
         super().__init__()
         
@@ -232,8 +233,8 @@ class ConformerModel(nn.Module):
 
         self.time_embedding = TimestepEmbedding(10, filter_size, filter_size)
         self.t_in_layer = nn.Linear(filter_size, filter_size)
-        self.residual_t_in_layer = nn.Linear(filter_size, in_channels)
-        self.residual_time_in_layer = nn.Linear(filter_size, in_channels)
+        self.residual_t_in_layer = nn.Linear(filter_size, postnet_in_channels - 2)
+        self.residual_time_in_layer = nn.Linear(filter_size, postnet_in_channels - 2)
 
         self.c_in_layer = nn.Linear(filter_size, filter_size)
 
@@ -257,7 +258,7 @@ class ConformerModel(nn.Module):
         # 2d convolutions for postnet
         self.postnet = nn.ModuleList()
         self.postnet_in_layer = nn.Conv2d(
-            in_channels=4,
+            in_channels=postnet_in_channels,
             out_channels=postnet_filter_size,
             kernel_size=(3, 3),
             padding=(1, 1),
@@ -271,7 +272,7 @@ class ConformerModel(nn.Module):
                         kernel_size=(3, 3),
                         padding=(1, 1),
                     ),
-                    nn.LayerNorm((postnet_filter_size, sample_size[0], sample_size[1])),
+                    nn.GroupNorm(1, postnet_filter_size),
                 )
             )
             if postnet_dropout > 0:
@@ -285,7 +286,7 @@ class ConformerModel(nn.Module):
                     kernel_size=(3, 3),
                     padding=(1, 1),
                 ),
-                nn.LayerNorm((1, sample_size[0], sample_size[1])),
+                nn.GroupNorm(1, 1),
             )
         )
 
@@ -366,19 +367,24 @@ class ConformerModel(nn.Module):
         step_embed = step_embed.repeat(1, out.shape[2], 1)
 
         x_conv = self.residual_in_layer(x).unsqueeze(1)
-        t_conv = self.residual_t_in_layer(t_condition).unsqueeze(1)
-        step_conv = self.residual_time_in_layer(step_embed).unsqueeze(1)
+        t_conv = self.residual_t_in_layer(t_condition)
+        # go from (batch_size, seq_len, 32) to (batch_size, 32, seq_len, 80)
+        t_conv = t_conv.transpose(1, 2).unsqueeze(-1)
+        t_conv = t_conv.repeat(1, 1, 1, out.shape[-1])
+        # go from (batch_size, seq_len, 32) to (batch_size, 32, seq_len, 80)
+        step_conv = self.residual_time_in_layer(step_embed)
+        step_conv = step_conv.transpose(1, 2).unsqueeze(-1)
+        step_conv = step_conv.repeat(1, 1, 1, out.shape[-1])
 
         out = torch.cat(
             (
                 out,
                 x_conv,
-                t_conv,
-                step_conv,
+                step_conv + t_conv,
             ),
             dim=1,
         )
-        # shape (batch_size, 4, seq_len, in_channels)
+        # shape (batch_size, postnet_in_channels, seq_len, freq_channels)
 
         # postnet
         out = self.postnet_in_layer(out)
