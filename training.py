@@ -148,10 +148,10 @@ def evaluate_mse_only(
             # get conditions
             for batch in eval_dataloader:
                 condition = batch["speaker_prompt_mel"]
+                enc_attn_mask = condition.sum(dim=-1) != 0
                 condition = normalize_mel(condition)
                 with torch.no_grad():
                     condition = condition_projection(condition)
-                enc_attn_mask = condition.sum(dim=-1) != 0
                 val_phone = phone_embedding(batch["phones"])
                 if args.train_type == "vocex":
                     images = pipeline(
@@ -160,6 +160,7 @@ def evaluate_mse_only(
                         cond=condition,
                         phones=val_phone,
                         encoder_attention_mask=enc_attn_mask,
+                        image_mask=batch["phone_mask"],
                     )
                     mask_size = batch["phone_mask"].sum()
                     images = denormalize_vocex(images) * batch["phone_mask"].unsqueeze(-1)
@@ -175,6 +176,7 @@ def evaluate_mse_only(
                         phones=val_phone,
                         vocex=val_vocex,
                         encoder_attention_mask=enc_attn_mask,
+                        image_mask=batch["frame_mask"],
                     )
                     images = denormalize_mel(images).detach() * batch["frame_mask"].unsqueeze(-1)
                     gt = batch["mel"] * batch["frame_mask"].unsqueeze(-1)
@@ -235,10 +237,11 @@ def evaluate(
         # get conditions
         for batch in eval_dataloader:
             condition = batch["speaker_prompt_mel"]
+            enc_attn_mask = condition.sum(dim=-1) != 0
             condition = normalize_mel(condition)
             with torch.no_grad():
                 condition = condition_projection(condition)
-            enc_attn_mask = condition.sum(dim=-1) != 0
+            #batch["phones"] = batch["phones"][:, torch.randperm(batch["phones"].shape[1])]
             val_phone = phone_embedding(batch["phones"])
             if args.train_type == "vocex":
                 images = pipeline(
@@ -247,6 +250,7 @@ def evaluate(
                     cond=condition,
                     phones=val_phone,
                     encoder_attention_mask=enc_attn_mask,
+                    image_mask=batch["phone_mask"],
                 )
                 for ij in range(val_phone.shape[0]):
                     gt = batch["vocex"][ij][batch["phone_mask"][ij]]
@@ -285,6 +289,7 @@ def evaluate(
                     phones=val_phone,
                     vocex=val_vocex,
                     encoder_attention_mask=enc_attn_mask,
+                    image_mask=batch["frame_mask"],
                 )
                 for ij in range(val_phone.shape[0]):
                     cond = batch["vocex"][ij][batch["frame_mask"][ij]]
@@ -319,9 +324,12 @@ def evaluate(
     mse_losses = accelerator.gather(mse_losses)
 
     if len(mse_losses) > 0:
-        mse_losses = torch.cat(mse_losses)
-        accelerator.print(f"mse loss: {torch.mean(mse_losses)}")
-        accelerator.get_tracker("wandb").log({"val/mse_loss": torch.mean(mse_losses)}, step=global_step)
+        try:
+            mse_losses = torch.mean(torch.cat(mse_losses))
+        except:
+            pass
+        accelerator.print(f"mse loss: {mse_losses}")
+        accelerator.get_tracker("wandb").log({"val/mse_loss": mse_losses}, step=global_step)
 
 
     if args.train_type == "mel":
@@ -763,6 +771,7 @@ def main():
                     sample_size=(resolution_x, resolution_y),
                     depthwise=False,
                     n_layers=16,
+                    postnet_dropout=0.1,
                 )
     else:
         if not args.is_conditional:
@@ -798,7 +807,13 @@ def main():
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
     ds_train = load_dataset("cdminix/libritts-r-aligned", split="train")
-    ds_val = load_dataset("cdminix/libritts-r-aligned", split="dev[:1%]")
+    ds_val = load_dataset("cdminix/libritts-r-aligned", split="dev[:5%]")
+
+    # set seeds
+    np.random.seed(args.eval_seed)
+    import random
+    random.seed(args.eval_seed)
+    torch.manual_seed(args.eval_seed)
 
     with open("data/speaker2idx.json", "r") as f:
         speaker2idx = json.load(f)
@@ -931,20 +946,7 @@ def main():
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
     if args.eval_only:
-        evaluate(
-            model,
-            args,
-            accelerator,
-            0,
-            noise_scheduler,
-            0,
-            eval_dataloader,
-            phone_embedding,
-            condition_projection,
-            vocex_projection,
-            phone2idx,
-        )
-        # evaluate_mse_only(
+        # evaluate(
         #     model,
         #     args,
         #     accelerator,
@@ -957,12 +959,43 @@ def main():
         #     vocex_projection,
         #     phone2idx,
         # )
+        evaluate_mse_only(
+            model,
+            args,
+            accelerator,
+            0,
+            noise_scheduler,
+            0,
+            eval_dataloader,
+            phone_embedding,
+            condition_projection,
+            vocex_projection,
+            phone2idx,
+        )
         accelerator.wait_for_everyone()
         return
 
     last_loss = None
     last_intermediate_loss = None
     last_final_loss = None
+
+    # random init model.postnet
+    model = accelerator.unwrap_model(model)
+    for p in model.postnet.parameters():
+        p.data = torch.randn_like(p.data) * 0.01
+    for p in model.postnet_linear.parameters():
+        p.data = torch.randn_like(p.data) * 0.01
+    for p in model.postnet_in_layer.parameters():
+        p.data = torch.randn_like(p.data) * 0.01
+    for p in model.residual_in_layer.parameters():
+        p.data = torch.randn_like(p.data) * 0.01
+    for p in model.residual_t_in_layer.parameters():
+        p.data = torch.randn_like(p.data) * 0.01
+    for p in model.residual_time_in_layer.parameters():
+        p.data = torch.randn_like(p.data) * 0.01
+
+    model = accelerator.prepare(model)
+
 
     # Train!
     for epoch in range(first_epoch, args.num_epochs):
@@ -1007,7 +1040,7 @@ def main():
             clean_images = clean_images * args.scale_factor # * 0.5 + 0.5
 
             condition = batch["speaker_prompt_mel"] # [bsz, length, 80]
-
+            enc_attn_mask = condition.sum(dim=-1) != 0
             condition = normalize_mel(condition)
             
             # Sample noise that we'll add to the images
@@ -1045,8 +1078,6 @@ def main():
                     phone = phone_embedding(phone)
                     phone = phone.reshape(bsz, 4, -1, 16)
                     noisy_images = torch.cat([noisy_images, phone], dim=1)
-
-                enc_attn_mask = condition.sum(dim=-1) != 0
                 
 
             with accelerator.accumulate(model):
@@ -1057,7 +1088,7 @@ def main():
                             noisy_images,
                             timesteps,
                             condition,
-                            #attention_mask=attn_mask,
+                            #attention_mask=,
                             encoder_attention_mask=enc_attn_mask
                         ).sample
                     elif args.model_type == "conformer":
@@ -1067,6 +1098,7 @@ def main():
                         noisy_images = noisy_images.reshape(bsz, -1, 80)
                         model_output_inter, model_output_final = model(
                             noisy_images,
+                            attn_mask,
                             timesteps,
                             t_condition,
                             condition,
@@ -1083,6 +1115,7 @@ def main():
                     if args.model_type == "conformer":
                         noise = noise.reshape(bsz, -1, 80)
                     loss_inter = F.mse_loss(model_output_inter, noise, reduction="none")
+                    # print(attn_mask)
                     loss_inter = loss_inter * attn_mask.unsqueeze(-1)
                     loss_final = F.mse_loss(model_output_final, noise, reduction="none")
                     loss_final = loss_final * attn_mask.unsqueeze(-1)

@@ -197,7 +197,7 @@ class TimestepEmbedding(nn.Module):
     def forward(self, steps):
         half_dim = self.dim_in // 2
         _embed = np.log(10000) / (half_dim - 1)
-        _embed = torch.exp(torch.arange(half_dim) * -_embed)
+        _embed = torch.exp(torch.arange(half_dim) * -_embed).to(steps.device)
         _embed = steps * _embed
         diff_embed = torch.cat(
             (torch.sin(_embed), torch.cos(_embed)),
@@ -221,6 +221,7 @@ class ConformerModel(nn.Module):
         sample_size=(512, 80),
         n_layers_postnet=6,
         postnet_filter_size=32,
+        postnet_dropout=0,
     ):
         super().__init__()
         
@@ -273,6 +274,8 @@ class ConformerModel(nn.Module):
                     nn.LayerNorm((postnet_filter_size, sample_size[0], sample_size[1])),
                 )
             )
+            if postnet_dropout > 0:
+                self.postnet.append(nn.Dropout(postnet_dropout))
 
         self.postnet.append(
             nn.Sequential(
@@ -327,9 +330,11 @@ class ConformerModel(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, x, timestep, t_condition=None, c_condition=None, c_mask=None, return_intermediate=False):
-        padding_mask = x.sum(dim=-1) != 0
-        padding_mask = padding_mask.to(x.dtype)
+    def forward(self, x, x_mask, timestep, t_condition=None, c_condition=None, c_mask=None, return_intermediate=False):
+        padding_mask = x_mask.unsqueeze(-1)
+        x = x * padding_mask
+        t_condition = t_condition * padding_mask
+        c_condition = c_condition * c_mask.unsqueeze(-1)
 
         step_embed = self.time_embedding(timestep)
 
@@ -342,7 +347,7 @@ class ConformerModel(nn.Module):
 
         out = self.layers(
             out,
-            src_key_padding_mask=padding_mask,
+            src_key_padding_mask=padding_mask.squeeze(-1),
             t_condition=t_condition,
             c_condition=c_condition,
             c_mask=c_mask
@@ -362,7 +367,7 @@ class ConformerModel(nn.Module):
 
         x_conv = self.residual_in_layer(x).unsqueeze(1)
         t_conv = self.residual_t_in_layer(t_condition).unsqueeze(1)
-        step_conv =self.residual_time_in_layer(step_embed).unsqueeze(1)
+        step_conv = self.residual_time_in_layer(step_embed).unsqueeze(1)
 
         out = torch.cat(
             (
@@ -390,6 +395,8 @@ class ConformerModel(nn.Module):
         out = out.squeeze(1)
 
         out = self.postnet_linear(out)
+
+        #return out_intermediate
 
         if return_intermediate:
             return out, out_intermediate

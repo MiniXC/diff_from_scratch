@@ -6,6 +6,8 @@ import numpy as np
 from diffusers.utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
+import imageio
+
 
 class DDPMPipeline(DiffusionPipeline):
     r"""
@@ -37,6 +39,7 @@ class DDPMPipeline(DiffusionPipeline):
         phones: Optional[torch.Tensor] = None,
         vocex: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
+        image_mask: Optional[torch.Tensor] = None,
     ) -> Union[ImagePipelineOutput, Tuple]:
         r"""
         Args:
@@ -55,6 +58,7 @@ class DDPMPipeline(DiffusionPipeline):
             [`~pipelines.ImagePipelineOutput`] or `tuple`: [`~pipelines.utils.ImagePipelineOutput`] if `return_dict` is
             True, otherwise a `tuple. When returning a tuple, the first element is a list with the generated images.
         """
+        all_images = []
 
         if self.seed is not None:
             # set seed and make deterministic
@@ -118,12 +122,17 @@ class DDPMPipeline(DiffusionPipeline):
                     timesteps = timesteps.repeat(bsz, 1, 1)
                     timesteps = timesteps.to(image.device)
                     noisy_images = image.reshape(bsz, -1, 80)
+                    print(noisy_images.min(), noisy_images.max(), noisy_images.mean(), "ni")
+                    print(timesteps.min(), timesteps.max(), "ts")
+                    print(t_condition.min(), t_condition.max(), t_condition.mean(), "t_cond")
+                    print(cond.min(), cond.max(), cond.mean(), "cond")
                     model_output = self.unet(
                         noisy_images,
+                        image_mask,
                         timesteps,
                         t_condition,
                         cond,
-                        cond.sum(dim=-1) != 0
+                        encoder_attention_mask,
                     ).to(self._device)
                 else:
                     model_output = self.unet(
@@ -137,8 +146,19 @@ class DDPMPipeline(DiffusionPipeline):
 
             # 2. compute previous image: x_t -> x_t-1
             image = self.scheduler.step(model_output, t, image).prev_sample.to(self._device)
+            # add to all_images for gif
+            gif_image = image.clone().detach().cpu()
+            # min-max normalize
+            gif_image = (gif_image - gif_image.min()) / (gif_image.max() - gif_image.min())
+            gif_image = (gif_image * 255).type(torch.uint8)
+            gif_image = gif_image.squeeze(0).T
+            # flip y axis
+            gif_image = gif_image.flip(0)
+            all_images.append(gif_image)
 
         if not self.is_conformer:
             image = image[:, 0]
+
+        imageio.mimsave('audio/diffusion_process.gif', all_images, duration=0.05)
 
         return image
