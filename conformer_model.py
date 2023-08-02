@@ -222,7 +222,6 @@ class ConformerModel(nn.Module):
         n_layers_postnet=6,
         postnet_filter_size=128,
         postnet_dropout=0.1,
-        postnet_in_channels=128,
     ):
         super().__init__()
         
@@ -233,8 +232,8 @@ class ConformerModel(nn.Module):
 
         self.time_embedding = TimestepEmbedding(10, filter_size, filter_size)
         self.t_in_layer = nn.Linear(filter_size, filter_size)
-        self.residual_t_in_layer = nn.Linear(filter_size, postnet_in_channels - 2)
-        self.residual_time_in_layer = nn.Linear(filter_size, postnet_in_channels - 2)
+        self.residual_t_in_layer = nn.Linear(filter_size, postnet_filter_size)
+        self.residual_time_in_layer = nn.Linear(filter_size, postnet_filter_size)
 
         self.c_in_layer = nn.Linear(filter_size, filter_size)
 
@@ -258,7 +257,7 @@ class ConformerModel(nn.Module):
         # 2d convolutions for postnet
         self.postnet = nn.ModuleList()
         self.postnet_in_layer = nn.Conv2d(
-            in_channels=postnet_in_channels,
+            in_channels=2,
             out_channels=postnet_filter_size,
             kernel_size=(3, 3),
             padding=(1, 1),
@@ -283,10 +282,10 @@ class ConformerModel(nn.Module):
                 nn.Conv2d(
                     in_channels=postnet_filter_size,
                     out_channels=1,
-                    kernel_size=(3, 3),
-                    padding=(1, 1),
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
                 ),
-                nn.GroupNorm(1, 1),
             )
         )
 
@@ -380,21 +379,20 @@ class ConformerModel(nn.Module):
             (
                 out,
                 x_conv,
-                step_conv + t_conv,
             ),
             dim=1,
         )
         # shape (batch_size, postnet_in_channels, seq_len, freq_channels)
 
         # postnet
-        out = self.postnet_in_layer(out)
+        out = self.postnet_in_layer(out) + step_conv + t_conv
         for p_i in range(len(self.postnet)-1):
             prev_out = out
             out = self.postnet[p_i](out)
-            out = out + prev_out
-            out = torch.relu(out)
+            out = out + prev_out + step_conv + t_conv
+            out = F.silu(out)
         out = self.postnet[-1](out)
-        out = torch.relu(out)
+        out = F.silu(out)
 
         # shape (batch_size, 1, seq_len, in_channels)
 

@@ -122,10 +122,6 @@ class DDPMPipeline(DiffusionPipeline):
                     timesteps = timesteps.repeat(bsz, 1, 1)
                     timesteps = timesteps.to(image.device)
                     noisy_images = image.reshape(bsz, -1, 80)
-                    print(noisy_images.min(), noisy_images.max(), noisy_images.mean(), "ni")
-                    print(timesteps.min(), timesteps.max(), "ts")
-                    print(t_condition.min(), t_condition.max(), t_condition.mean(), "t_cond")
-                    print(cond.min(), cond.max(), cond.mean(), "cond")
                     model_output = self.unet(
                         noisy_images,
                         image_mask,
