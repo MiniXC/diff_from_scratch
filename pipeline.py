@@ -21,7 +21,7 @@ class DDPMPipeline(DiffusionPipeline):
             [`DDPMScheduler`], or [`DDIMScheduler`].
     """
 
-    def __init__(self, unet, scheduler, conditional=False, is_mel=False, seed=None, is_conformer=False, device=None):
+    def __init__(self, unet, scheduler, conditional=False, is_mel=False, seed=None, is_conformer=False, device=None, loss_mode=None):
         super().__init__()
         self.register_modules(unet=unet, scheduler=scheduler)
         self.conditional = conditional
@@ -29,6 +29,7 @@ class DDPMPipeline(DiffusionPipeline):
         self.seed = seed
         self.is_conformer = is_conformer
         self._device = device
+        self.loss_mode = loss_mode
 
     @torch.no_grad()
     def __call__(
@@ -58,6 +59,16 @@ class DDPMPipeline(DiffusionPipeline):
             [`~pipelines.ImagePipelineOutput`] or `tuple`: [`~pipelines.utils.ImagePipelineOutput`] if `return_dict` is
             True, otherwise a `tuple. When returning a tuple, the first element is a list with the generated images.
         """
+
+        if self.loss_mode == "mse":
+            t_condition = torch.cat([phones, vocex], dim=2)
+            model_output = self.unet(
+                image_mask,
+                t_condition,
+                cond,
+                encoder_attention_mask,
+            ).to(self._device)
+
         all_images = []
 
         if self.seed is not None:

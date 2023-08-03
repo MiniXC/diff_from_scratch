@@ -331,17 +331,23 @@ class ConformerModel(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, x, x_mask, timestep, t_condition=None, c_condition=None, c_mask=None, return_intermediate=False):
+    def forward(self, x=None, x_mask=None, timestep=None, t_condition=None, c_condition=None, c_mask=None, return_intermediate=False):
         padding_mask = x_mask.unsqueeze(-1)
-        x = x * padding_mask
+        if x is not None:
+            x = x * padding_mask
+        else:
+            x = t_condition
         t_condition = t_condition * padding_mask
         c_condition = c_condition * c_mask.unsqueeze(-1)
 
-        step_embed = self.time_embedding(timestep)
+        if timestep is None:
+            step_embed = torch.zeros(x.shape[0], 1, x.shape[-1]).to(x.device)
+        else:
+            step_embed = self.time_embedding(timestep)
 
         t_condition = self.t_in_layer(t_condition + step_embed)
         c_condition = self.c_in_layer(c_condition)
-
+        
         out = self.in_layer(x)
         out = self.positional_encoding(out)
 

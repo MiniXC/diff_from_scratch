@@ -129,6 +129,7 @@ def evaluate_mse_only(
             is_mel=args.train_type == "mel",
             device=accelerator.device,
             is_conformer=args.model_type == "conformer",
+            loss_mode=args.loss_mode,
         )
     else:
         pipeline = DDPMPipeline(
@@ -137,6 +138,7 @@ def evaluate_mse_only(
             conditional=False,
             device=accelerator.device,
             is_conformer=args.model_type == "conformer",
+            loss_mode=args.loss_mode,
         )
 
     mse_losses = []
@@ -220,6 +222,7 @@ def evaluate(
             is_mel=args.train_type == "mel",
             device=accelerator.device,
             is_conformer=args.model_type == "conformer",
+            loss_mode=args.loss_mode,
         )
     else:
         pipeline = DDPMPipeline(
@@ -228,6 +231,7 @@ def evaluate(
             conditional=False,
             device=accelerator.device,
             is_conformer=args.model_type == "conformer",
+            loss_mode=args.loss_mode,
         )
 
     mse_losses = []
@@ -476,6 +480,9 @@ def parse_args():
     )
     parser.add_argument(
         "--eval_batch_size", type=int, default=1, help="The number of images to generate for evaluation."
+    )
+    parser.add_argument(
+        "--loss_mode", type=str, default="diffusion", choices=["diffusion", "mse"], help="The loss mode to use."
     )
     parser.add_argument(
         "--dataloader_num_workers",
@@ -1075,18 +1082,26 @@ def main():
                         ).sample
                     elif args.model_type == "conformer":
                         # concat in channel dim (phones & vocex)
-                        t_condition = torch.cat([phone, vocex], dim=2)
-                        timesteps = timesteps.unsqueeze(-1).unsqueeze(-1)
-                        noisy_images = noisy_images.reshape(bsz, -1, 80)
-                        model_output_inter, model_output_final = model(
-                            noisy_images,
-                            attn_mask,
-                            timesteps,
-                            t_condition,
-                            condition,
-                            enc_attn_mask,
-                            return_intermediate=True,
-                        )
+                        if args.loss_mode == "diffusion":
+                            t_condition = torch.cat([phone, vocex], dim=2)
+                            timesteps = timesteps.unsqueeze(-1).unsqueeze(-1)
+                            noisy_images = noisy_images.reshape(bsz, -1, 80)
+                            model_output_inter, model_output_final = model(
+                                noisy_images,
+                                attn_mask,
+                                timesteps,
+                                t_condition,
+                                condition,
+                                enc_attn_mask,
+                                return_intermediate=True,
+                            )
+                        elif args.loss_mode == "mse":
+                            model_output_inter, model_output_final = model(
+                                attn_mask,
+                                condition,
+                                enc_attn_mask,
+                                return_intermediate=True,
+                            )
                 else:
                     model_output = model(
                         noisy_images,
@@ -1094,14 +1109,19 @@ def main():
                     ).sample
 
                 if args.prediction_type == "epsilon":
-                    if args.model_type == "conformer":
-                        noise = noise.reshape(bsz, -1, 80)
-                    loss_inter = F.mse_loss(model_output_inter, noise, reduction="none")
-                    # print(attn_mask)
-                    loss_inter = loss_inter * attn_mask.unsqueeze(-1)
-                    loss_final = F.mse_loss(model_output_final, noise, reduction="none")
-                    loss_final = loss_final * attn_mask.unsqueeze(-1)
-                    loss = (loss_inter.mean() + loss_final.mean()) / 2
+                    if args.loss_mode == "diffusion":
+                        if args.model_type == "conformer":
+                            noise = noise.reshape(bsz, -1, 80)
+                        loss_inter = F.mse_loss(model_output_inter, noise, reduction="none")
+                        # print(attn_mask)
+                        loss_inter = loss_inter * attn_mask.unsqueeze(-1)
+                        loss_final = F.mse_loss(model_output_final, noise, reduction="none")
+                        loss_final = loss_final * attn_mask.unsqueeze(-1)
+                        loss = (loss_inter.mean() + loss_final.mean()) / 2
+                    elif args.loss_mode == "mse":
+                        loss_inter = F.mse_loss(model_output_inter, clean_images, reduction="none")
+                        loss_final = F.mse_loss(model_output_final, clean_images, reduction="none")
+                        loss = (loss_inter.mean() + loss_final.mean()) / 2
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
