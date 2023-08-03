@@ -519,7 +519,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4*16*2,
+        default=1e-3,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -1161,7 +1161,7 @@ def main():
                         loss_final = F.mse_loss(model_output_final, noise, reduction="none")
                         loss_final = loss_final * attn_mask.unsqueeze(-1)
                         #loss = loss_final.mean()
-                        loss = (loss_inter.sum() + loss_final.sum()) / 2 / (attn_mask.sum() * 80)
+                        loss = (loss_inter.sum() * 9 + loss_final.sum()) / 10 / (attn_mask.sum() * 80)
                         loss_inter = loss_inter.sum() / (attn_mask.sum() * 80)
                         loss_final = loss_final.sum() / (attn_mask.sum() * 80)
                     elif args.loss_mode == "mse":
@@ -1187,8 +1187,8 @@ def main():
 
                 accelerator.backward(loss)
 
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                #if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1199,7 +1199,7 @@ def main():
                 global_step += 1
 
             logs = {"lr": lr_scheduler.get_last_lr()[0], "step": global_step}
-            if args.log_loss_every != 0:
+            if args.log_loss_every != 0 and accelerator.is_local_main_process:
                 losses.append(loss)
                 intermediate_losses.append(loss_inter)
                 final_losses.append(loss_final)
@@ -1213,12 +1213,12 @@ def main():
                     losses = []
                     intermediate_losses = []
                     final_losses = []
+                    accelerator.log(logs, step=global_step)
                 else:
                     logs["loss"] = last_loss
                     logs["inter_loss"] = last_intermediate_loss
                     logs["final_loss"] = last_final_loss
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+                progress_bar.set_postfix(**logs)
         progress_bar.close()
 
         accelerator.wait_for_everyone()
