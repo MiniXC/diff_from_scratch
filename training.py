@@ -496,7 +496,7 @@ def parse_args():
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--save_images_epochs", type=int, default=1, help="How often to save images during training.")
     parser.add_argument(
-        "--save_model_epochs", type=int, default=2, help="How often to save the model during training."
+        "--save_model_epochs", type=int, default=5, help="How often to save the model during training."
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -519,13 +519,13 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-4,
+        default=1e-4*16*2,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="constant_with_warmup",
+        default="cosine",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
             ' "constant", "constant_with_warmup"]'
@@ -848,7 +848,7 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    ds_train = load_dataset("cdminix/libritts-r-aligned", split="train[:1%]")
+    ds_train = load_dataset("cdminix/libritts-r-aligned", split="train")
     ds_val = load_dataset("cdminix/libritts-r-aligned", split="dev[:5%]")
 
     # set seeds
@@ -1154,6 +1154,7 @@ def main():
                     if args.loss_mode == "diffusion":
                         if args.model_type == "conformer":
                             noise = noise.reshape(bsz, -1, 80)
+                            clean_images = clean_images.reshape(bsz, -1, 80)
                         loss_inter = F.mse_loss(model_output_inter, clean_images, reduction="none")
                         # print(attn_mask)
                         loss_inter = loss_inter * attn_mask.unsqueeze(-1)
@@ -1252,7 +1253,7 @@ def main():
 
         accelerator.wait_for_everyone()
 
-        if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1 or True:
+        if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
             accelerator.wait_for_everyone()
 
             # save the model
