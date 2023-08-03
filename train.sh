@@ -1,6 +1,6 @@
 accelerate launch training.py \
 --wandb_mode=offline \
 --model_type=conformer \
---model_id=conformer_postnet_16l_fix3 \
+--model_id=test_dtts \
 --no_eval \
---loss_mode="mse"
+--train_batch_size=1

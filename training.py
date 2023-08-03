@@ -32,7 +32,7 @@ from conformer_model import ConformerModel
 # from augmentations import wave_augmentation_func
 
 import diffusers
-from diffusers import DDPMScheduler, UNet2DModel, UNet2DConditionModel # DDPMPipeline
+from diffusers import DDPMScheduler, UNet2DModel, UNet2DConditionModel, DDIMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
 from pipeline import DDPMPipeline
@@ -433,7 +433,7 @@ def parse_args():
     parser.add_argument(
         "--scale_factor",
         type=float,
-        default=0.7,
+        default=0.5,
         help="The scale factor to apply to the noise sampled from the diffusion process.",
     )
     parser.add_argument(
@@ -525,7 +525,7 @@ def parse_args():
     parser.add_argument(
         "--lr_scheduler",
         type=str,
-        default="cosine",
+        default="constant_with_warmup",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
             ' "constant", "constant_with_warmup"]'
@@ -579,7 +579,7 @@ def parse_args():
         help="Whether the model should predict the 'epsilon'/noise error or directly the reconstructed image 'x0'.",
     )
     parser.add_argument("--ddpm_num_steps", type=int, default=1000)
-    parser.add_argument("--ddpm_num_inference_steps", type=int, default=100)
+    parser.add_argument("--ddpm_num_inference_steps", type=int, default=10)
     parser.add_argument("--ddpm_beta_schedule", type=str, default="sigmoid")
     parser.add_argument(
         "--checkpointing_steps",
@@ -774,11 +774,41 @@ def main():
                     cross_attention_dim=128,
                 )
             elif args.model_type == "conformer":
+                unet = UNet2DConditionModel(
+                    sample_size=(resolution_x, resolution_y),
+                    in_channels=128,
+                    out_channels=1,
+                    layers_per_block=2,
+                    conv_in_kernel=kernel_size,
+                    conv_out_kernel=kernel_size,
+                    block_out_channels=(
+                        64,
+                        64,
+                        128,
+                        256,
+                        512,
+                    ),
+                    down_block_types=(
+                        "DownBlock2D",
+                        "DownBlock2D",
+                        "DownBlock2D",
+                        "AttnDownBlock2D",
+                        "DownBlock2D",
+                    ),
+                    up_block_types=(
+                        "UpBlock2D",
+                        "AttnUpBlock2D",
+                        "UpBlock2D",
+                        "UpBlock2D",
+                        "UpBlock2D",
+                    ),
+                    cross_attention_dim=512,
+                )
                 model = ConformerModel(
                     sample_size=(resolution_x, resolution_y),
                     depthwise=False,
                     n_layers=16,
-                    postnet_dropout=0.1,
+                    unet=unet,
                 )
     else:
         if not args.is_conditional:
@@ -795,10 +825,15 @@ def main():
             num_train_timesteps=args.ddpm_num_steps,
             beta_schedule=args.ddpm_beta_schedule,
             prediction_type=args.prediction_type,
+            timestep_spacing="linspace",
         )
     else:
-        noise_scheduler = DDPMScheduler(num_train_timesteps=args.ddpm_num_steps, beta_schedule=args.ddpm_beta_schedule)
-
+        noise_scheduler = DDPMScheduler(
+            num_train_timesteps=args.ddpm_num_steps,
+            beta_schedule=args.ddpm_beta_schedule,
+            timestep_spacing="linspace",
+        )
+    
     # Initialize the optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -813,7 +848,7 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    ds_train = load_dataset("cdminix/libritts-r-aligned", split="train")
+    ds_train = load_dataset("cdminix/libritts-r-aligned", split="train[:1%]")
     ds_val = load_dataset("cdminix/libritts-r-aligned", split="dev[:5%]")
 
     # set seeds
@@ -953,20 +988,7 @@ def main():
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
 
     if args.eval_only:
-        # evaluate(
-        #     model,
-        #     args,
-        #     accelerator,
-        #     0,
-        #     noise_scheduler,
-        #     0,
-        #     eval_dataloader,
-        #     phone_embedding,
-        #     condition_projection,
-        #     vocex_projection,
-        #     phone2idx,
-        # )
-        evaluate_mse_only(
+        evaluate(
             model,
             args,
             accelerator,
@@ -979,6 +1001,19 @@ def main():
             vocex_projection,
             phone2idx,
         )
+        # evaluate_mse_only(
+        #     model,
+        #     args,
+        #     accelerator,
+        #     0,
+        #     noise_scheduler,
+        #     0,
+        #     eval_dataloader,
+        #     phone_embedding,
+        #     condition_projection,
+        #     vocex_projection,
+        #     phone2idx,
+        # )
         accelerator.wait_for_everyone()
         return
 
@@ -1083,6 +1118,11 @@ def main():
                     elif args.model_type == "conformer":
                         # concat in channel dim (phones & vocex)
                         if args.loss_mode == "diffusion":
+                            # randomly mask out some vocex and phone
+                            vocex_mask = torch.rand(bsz, phone.shape[1], 1) > 0.5
+                            phone_mask = torch.rand(bsz, phone.shape[1], 1) > 0.1
+                            vocex = vocex * vocex_mask.to(vocex.device)
+                            phone = phone * phone_mask.to(phone.device)
                             t_condition = torch.cat([phone, vocex], dim=2)
                             timesteps = timesteps.unsqueeze(-1).unsqueeze(-1)
                             noisy_images = noisy_images.reshape(bsz, -1, 80)
@@ -1096,10 +1136,12 @@ def main():
                                 return_intermediate=True,
                             )
                         elif args.loss_mode == "mse":
+                            t_condition = torch.cat([phone, vocex], dim=2)
                             model_output_inter, model_output_final = model(
-                                attn_mask,
-                                condition,
-                                enc_attn_mask,
+                                x_mask=attn_mask,
+                                t_condition=t_condition,
+                                c_condition=condition,
+                                c_mask=enc_attn_mask,
                                 return_intermediate=True,
                             )
                 else:
@@ -1112,16 +1154,21 @@ def main():
                     if args.loss_mode == "diffusion":
                         if args.model_type == "conformer":
                             noise = noise.reshape(bsz, -1, 80)
-                        loss_inter = F.mse_loss(model_output_inter, noise, reduction="none")
+                        loss_inter = F.mse_loss(model_output_inter, clean_images, reduction="none")
                         # print(attn_mask)
                         loss_inter = loss_inter * attn_mask.unsqueeze(-1)
                         loss_final = F.mse_loss(model_output_final, noise, reduction="none")
                         loss_final = loss_final * attn_mask.unsqueeze(-1)
-                        loss = (loss_inter.mean() + loss_final.mean()) / 2
+                        #loss = loss_final.mean()
+                        loss = (loss_inter.sum() + loss_final.sum()) / 2 / (attn_mask.sum() * 80)
+                        loss_inter = loss_inter.sum() / (attn_mask.sum() * 80)
+                        loss_final = loss_final.sum() / (attn_mask.sum() * 80)
                     elif args.loss_mode == "mse":
                         loss_inter = F.mse_loss(model_output_inter, clean_images, reduction="none")
+                        loss_inter = loss_inter * attn_mask.unsqueeze(-1)
                         loss_final = F.mse_loss(model_output_final, clean_images, reduction="none")
-                        loss = (loss_inter.mean() + loss_final.mean()) / 2
+                        loss_final = loss_final * attn_mask.unsqueeze(-1)
+                        loss = (loss_inter + loss_final).mean() / 2
                 elif args.prediction_type == "sample":
                     alpha_t = _extract_into_tensor(
                         noise_scheduler.alphas_cumprod, timesteps, (clean_images.shape[0], 1, 1, 1)
@@ -1153,8 +1200,8 @@ def main():
             logs = {"lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             if args.log_loss_every != 0:
                 losses.append(loss)
-                intermediate_losses.append(loss_inter.mean())
-                final_losses.append(loss_final.mean())
+                intermediate_losses.append(loss_inter)
+                final_losses.append(loss_final)
                 if global_step % args.log_loss_every == 0:
                     logs["loss"] = torch.mean(torch.tensor(losses)).item()
                     logs["inter_loss"] = torch.mean(torch.tensor(intermediate_losses)).item()
@@ -1177,19 +1224,7 @@ def main():
 
         # Generate sample images for visual inspection
         if (epoch % args.save_images_epochs == 0 or epoch == args.num_epochs - 1):
-            # evaluate(
-            #     model,
-            #     args,
-            #     accelerator,
-            #     epoch,
-            #     noise_scheduler,
-            #     global_step,
-            #     eval_dataloader,
-            #     phone_embedding,
-            #     condition_projection,
-            #     vocex_projection,
-            # )
-            evaluate_mse_only(
+            evaluate(
                 model,
                 args,
                 accelerator,
@@ -1200,12 +1235,24 @@ def main():
                 phone_embedding,
                 condition_projection,
                 vocex_projection,
-                phone2idx,
             )
+            # evaluate_mse_only(
+            #     model,
+            #     args,
+            #     accelerator,
+            #     epoch,
+            #     noise_scheduler,
+            #     global_step,
+            #     eval_dataloader,
+            #     phone_embedding,
+            #     condition_projection,
+            #     vocex_projection,
+            #     phone2idx,
+            # )
 
         accelerator.wait_for_everyone()
 
-        if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
+        if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1 or True:
             accelerator.wait_for_everyone()
 
             # save the model

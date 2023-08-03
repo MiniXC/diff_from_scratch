@@ -60,15 +60,6 @@ class DDPMPipeline(DiffusionPipeline):
             True, otherwise a `tuple. When returning a tuple, the first element is a list with the generated images.
         """
 
-        if self.loss_mode == "mse":
-            t_condition = torch.cat([phones, vocex], dim=2)
-            model_output = self.unet(
-                image_mask,
-                t_condition,
-                cond,
-                encoder_attention_mask,
-            ).to(self._device)
-
         all_images = []
 
         if self.seed is not None:
@@ -132,7 +123,19 @@ class DDPMPipeline(DiffusionPipeline):
                     timesteps = t.unsqueeze(-1).unsqueeze(-1)
                     timesteps = timesteps.repeat(bsz, 1, 1)
                     timesteps = timesteps.to(image.device)
-                    noisy_images = image.reshape(bsz, -1, 80)
+                    noisy_images = image.squeeze(1)
+                    if self.loss_mode == "mse" or False:
+                        t_condition = torch.cat([phones, vocex], dim=2)
+                        model_output, _ = self.unet(
+                            noisy_images,
+                            image_mask,
+                            timesteps,
+                            t_condition,
+                            cond,
+                            encoder_attention_mask,
+                            return_intermediate=True,
+                        )
+                        return model_output
                     model_output = self.unet(
                         noisy_images,
                         image_mask,
@@ -163,7 +166,7 @@ class DDPMPipeline(DiffusionPipeline):
             gif_image = gif_image.flip(0)
             all_images.append(gif_image)
 
-        if not self.is_conformer:
+        if not self.is_conformer or True:
             image = image[:, 0]
 
         imageio.mimsave('audio/diffusion_process.gif', all_images, duration=0.05)
