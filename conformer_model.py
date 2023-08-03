@@ -8,6 +8,7 @@ from torch.nn import TransformerEncoderLayer
 from torch.nn import MultiheadAttention
 import numpy as np
 import argparse
+import torch.nn.functional as F
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000, dropout=0.1):

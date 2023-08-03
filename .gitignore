@@ -6,3 +6,4 @@ audio/
 checkpoint-*/
 *.png
 *.zip
+.vscode/
