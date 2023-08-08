@@ -306,6 +306,9 @@ class ConformerModel(nn.Module):
         out_intermediate = self.linear(out)
 
         out = out_intermediate.unsqueeze(1)
+        # clip to range [-5, 5] for numerical stability
+        out = torch.clamp(out, -5, 5)
+        
         # shape (batch_size, seq_len, in_channels)
 
         # shape (batch_size, 1, seq_len, in_channels)
