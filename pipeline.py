@@ -114,6 +114,9 @@ class DDPMPipeline(DiffusionPipeline):
         # set step values
         self.scheduler.set_timesteps(num_inference_steps)
 
+        # randomly mask out 50% of vocex
+        vocex = (torch.rand_like(vocex) < 0.5) * vocex
+
         for t in self.progress_bar(self.scheduler.timesteps):
             # 1. predict noise model_output
             if self.conditional:
@@ -166,6 +169,8 @@ class DDPMPipeline(DiffusionPipeline):
             gif_image = gif_image.flip(0)
             all_images.append(gif_image)
 
+
+        image = image / 0.5
         if not self.is_conformer or True:
             image = image[:, 0]
 

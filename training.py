@@ -236,6 +236,9 @@ def evaluate(
 
     mse_losses = []
 
+    num_images = 0
+    max_num_images = 3
+
     # run pipeline in inference (sample random noise and denoise)
     if args.is_conditional:
         # get conditions
@@ -312,12 +315,49 @@ def evaluate(
                     axs[2].imshow(pred, vmin=gt.min(), vmax=gt.max(), origin="lower")
                     axs[2].set_title(f"pred min: {pred.min()}, pred max: {pred.max()}")
                     process_idx = accelerator.process_index
-                    plt.savefig(f"audio/image_{ij}_{process_idx}.png")
+                    plt.savefig(f"audio/image_{num_images}_{ij}_{process_idx}.png")
                     plt.close()
                     if accelerator.is_main_process:
-                        img = Image.open(f"audio/image_{ij}_{process_idx}.png")
+                        img = Image.open(f"audio/image_{num_images}_{ij}_{process_idx}.png")
                         accelerator.get_tracker("wandb").log({"val/plot": [wandb.Image(img)]}, step=global_step)
-            break
+                audios = []
+                gt_audios = []
+                process_idx = accelerator.process_index
+                for i in range(images.shape[0]):
+                    audios.append(
+                        synth(
+                            denormalize_mel(images[i][batch["frame_mask"][i]]).cpu()
+                        )
+                    )
+                    # save audio
+                    sf.write(
+                        f"audio/audio_{num_images}_{i}_{process_idx}.wav",
+                        audios[-1][0],
+                        22050,
+                    )
+                    # log to wandb
+                    accelerator.get_tracker("wandb").log({
+                        f"val/audio_{i}_{process_idx}": wandb.Audio(f"audio/audio_{num_images}_{i}_{process_idx}.wav")
+                    }, step=global_step)
+                    # do the same for the gt
+                    gt_audios.append(
+                        synth(
+                            batch["mel"][i][batch["frame_mask"][i]].cpu()
+                        )
+                    )
+                    # save audio
+                    sf.write(
+                        f"audio/gt_audio_{num_images}_{i}_{process_idx}.wav",
+                        gt_audios[-1][0],
+                        22050,
+                    )
+                    # log to wandb
+                    accelerator.get_tracker("wandb").log({
+                        f"val/gt_audio_{num_images}_{i}_{process_idx}": wandb.Audio(f"audio/gt_audio_{num_images}_{i}_{process_idx}.wav")
+                    }, step=global_step)
+            num_images += 1
+            if num_images >= max_num_images:
+                break
     else:
         images = pipeline(
             batch_size=args.eval_batch_size,
@@ -334,44 +374,6 @@ def evaluate(
             pass
         accelerator.print(f"mse loss: {mse_losses}")
         accelerator.get_tracker("wandb").log({"val/mse_loss": mse_losses}, step=global_step)
-
-
-    if args.train_type == "mel":
-        audios = []
-        gt_audios = []
-        process_idx = accelerator.process_index
-        for i in range(images.shape[0]):
-            audios.append(
-                synth(
-                    denormalize_mel(images[i][batch["frame_mask"][i]]).cpu()
-                )
-            )
-            # save audio
-            sf.write(
-                f"audio/audio_{i}_{process_idx}.wav",
-                audios[-1][0],
-                22050,
-            )
-            # log to wandb
-            accelerator.get_tracker("wandb").log({
-                f"val/audio_{i}_{process_idx}": wandb.Audio(f"audio/audio_{i}_{process_idx}.wav")
-            }, step=global_step)
-            # do the same for the gt
-            gt_audios.append(
-                synth(
-                    batch["mel"][i][batch["frame_mask"][i]].cpu()
-                )
-            )
-            # save audio
-            sf.write(
-                f"audio/gt_audio_{i}_{process_idx}.wav",
-                gt_audios[-1][0],
-                22050,
-            )
-            # log to wandb
-            accelerator.get_tracker("wandb").log({
-                f"val/gt_audio_{i}_{process_idx}": wandb.Audio(f"audio/gt_audio_{i}_{process_idx}.wav")
-            }, step=global_step)
 
 
 def parse_args():
