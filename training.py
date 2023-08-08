@@ -519,7 +519,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-3,
+        default=6e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -1061,6 +1061,7 @@ def main():
                 clean_images = normalize_vocex(clean_images)
             # get to mean 0.5 and std 0.5
 
+            clean_images_mse = clean_images
             clean_images = clean_images * args.scale_factor # * 0.5 + 0.5
 
             condition = batch["speaker_prompt_mel"] # [bsz, length, 80]
@@ -1154,14 +1155,14 @@ def main():
                     if args.loss_mode == "diffusion":
                         if args.model_type == "conformer":
                             noise = noise.reshape(bsz, -1, 80)
-                            clean_images = clean_images.reshape(bsz, -1, 80)
-                        loss_inter = F.mse_loss(model_output_inter, clean_images, reduction="none")
-                        # print(attn_mask)
+                            clean_images_mse = clean_images_mse.reshape(bsz, -1, 80)
+                        loss_inter = F.mse_loss(model_output_inter, clean_images_mse, reduction="none")
+                        # print(attn_mask)clean_images
                         loss_inter = loss_inter * attn_mask.unsqueeze(-1)
                         loss_final = F.mse_loss(model_output_final, noise, reduction="none")
                         loss_final = loss_final * attn_mask.unsqueeze(-1)
                         #loss = loss_final.mean()
-                        loss = (loss_inter.sum() * 9 + loss_final.sum()) / 10 / (attn_mask.sum() * 80)
+                        loss = (loss_inter.sum() * 5 + loss_final.sum()) / 6 / (attn_mask.sum() * 80)
                         loss_inter = loss_inter.sum() / (attn_mask.sum() * 80)
                         loss_final = loss_final.sum() / (attn_mask.sum() * 80)
                     elif args.loss_mode == "mse":
