@@ -127,7 +127,7 @@ class DDPMPipeline(DiffusionPipeline):
                     timesteps = timesteps.repeat(bsz, 1, 1)
                     timesteps = timesteps.to(image.device)
                     noisy_images = image.squeeze(1)
-                    if self.loss_mode == "mse" or False:
+                    if self.loss_mode == "mse" or True:
                         t_condition = torch.cat([phones, vocex], dim=2)
                         model_output, _ = self.unet(
                             noisy_images,

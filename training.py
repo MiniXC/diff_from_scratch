@@ -10,6 +10,7 @@ import json
 # PIL
 from PIL import Image
 import soundfile as sf
+from copy import deepcopy
 
 from matplotlib import pyplot as plt
 import accelerate
@@ -26,6 +27,7 @@ import numpy as np
 from vocex import Vocex
 from hifigan import Synthesiser
 import wandb
+import torchaudio
 
 from conformer_model import ConformerModel
 
@@ -243,6 +245,7 @@ def evaluate(
     if args.is_conditional:
         # get conditions
         for batch in eval_dataloader:
+            speaker_prompt = batch["speaker_prompt_mel"]
             condition = batch["speaker_prompt_mel"]
             enc_attn_mask = condition.sum(dim=-1) != 0
             condition = normalize_mel(condition)
@@ -298,7 +301,11 @@ def evaluate(
                     encoder_attention_mask=enc_attn_mask,
                     image_mask=batch["frame_mask"],
                 )
+                ignore_idx = []
                 for ij in range(val_phone.shape[0]):
+                    if batch["frame_mask"][ij].sum() >= 500:
+                        ignore_idx.append(ij)
+                        continue
                     cond = batch["vocex"][ij][batch["frame_mask"][ij]]
                     gt = batch["mel"][ij][batch["frame_mask"][ij]]
                     pred = images[ij][batch["frame_mask"][ij]]
@@ -322,8 +329,11 @@ def evaluate(
                         accelerator.get_tracker("wandb").log({"val/plot": [wandb.Image(img)]}, step=global_step)
                 audios = []
                 gt_audios = []
+                prompt_audios = []
                 process_idx = accelerator.process_index
                 for i in range(images.shape[0]):
+                    if i in ignore_idx:
+                        continue
                     audios.append(
                         synth(
                             denormalize_mel(images[i][batch["frame_mask"][i]]).cpu()
@@ -355,6 +365,21 @@ def evaluate(
                     accelerator.get_tracker("wandb").log({
                         f"val/gt_audio_{num_images}_{i}_{process_idx}": wandb.Audio(f"audio/gt_audio_{num_images}_{i}_{process_idx}.wav")
                     }, step=global_step)
+                    # do the same for the prompt
+                    prompt = batch["speaker_prompt_mel"][i].cpu()
+                    # resample prompt mel spec from 24k to 22.05k
+                    resampler = torchaudio.transforms.Resample(24000, 22050)
+                    #prompt = resampler(prompt.T).T[:-2]
+                    aud = torch.tensor(synth(prompt))
+                    # to float
+                    aud = resampler(aud / 32768).numpy()
+                    prompt_audios.append(aud)
+                    # save audio
+                    sf.write(
+                        f"audio/prompt_audio_{num_images}_{i}_{process_idx}.wav",
+                        prompt_audios[-1][0],
+                        22050,
+                    )
             num_images += 1
             if num_images >= max_num_images:
                 break
@@ -902,10 +927,12 @@ def main():
         shuffle=True,
     )
 
+    eval_collator = deepcopy(collator)
+    eval_collator.return_keys.append("text")
     eval_dataloader = torch.utils.data.DataLoader(
         ds_val,
         batch_size=args.eval_batch_size,
-        collate_fn=collator.collate_fn,
+        collate_fn=eval_collator.collate_fn,
         num_workers=args.dataloader_num_workers,
         shuffle=False,
     )
